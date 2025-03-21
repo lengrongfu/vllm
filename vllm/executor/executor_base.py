@@ -88,6 +88,7 @@ class ExecutorBase(ABC):
         """
         raise NotImplementedError
 
+    # determine_num_available_blocks 函数的作用是确定 GPU KV 缓存和可交换 CPU KV 缓存的可用块数。它通常会委托给底层的 Worker 来执行此操作。该函数返回一个元组，包含两个整数：num_gpu_blocks 表示设备上“活动”的块数，可以追加数据；num_cpu_blocks 表示在 CPU 内存中“交换”的块数，不能追加数据。
     def determine_num_available_blocks(self) -> Tuple[int, int]:
         """Determine the number of available blocks for the GPU KV cache and
         swappable CPU KV cache.
