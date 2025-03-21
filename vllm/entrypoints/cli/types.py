@@ -5,7 +5,7 @@ import argparse
 
 from vllm.utils import FlexibleArgumentParser
 
-
+# 这是命令函数的基类，所有的命令函数都应该继承这个类；目前主要实现了serve.py 和 openai.py
 class CLISubcommand:
     """Base class for CLI argument handlers."""
 
