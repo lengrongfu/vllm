@@ -1,0 +1,4 @@
+python3 benchmarks/benchmark_serving.py --backend openai --model Qwen/Qwen1.5-7B --dataset-name rando --max-concurrency 8 --num-prompts 1000 --random-input-len 256 --random-output-len 768 2>&1 | tee -a result.txt
+
+
+python3 benchmarks/benchmark_serving.py --model Qwen/Qwen1.5-7B --dataset-name random --max-concurrency 8 --num-prompts 20 --random-input-len 256 --random-output-len 768 2>&1 | tee -a result.txt

@@ -17,8 +17,8 @@ from typing_extensions import TypeVar, deprecated
 
 import vllm.envs as envs
 from vllm.config import (DecodingConfig, LoRAConfig, ModelConfig,
-                         ObservabilityConfig, ParallelConfig, SchedulerConfig,
-                         VllmConfig)
+                         ObservabilityConfig, ParallelConfig,
+                         PowerManagementConfig, SchedulerConfig, VllmConfig)
 from vllm.core.scheduler import ScheduledSequenceGroup, SchedulerOutputs
 from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.metrics_types import StatLoggerBase, Stats
@@ -239,6 +239,8 @@ class LLMEngine:
         self.prompt_adapter_config = vllm_config.prompt_adapter_config  # noqa
         self.observability_config = vllm_config.observability_config or ObservabilityConfig(  # noqa
         )
+        self.power_management_config = vllm_config.power_management_config or PowerManagementConfig(  # noqa
+        )
 
         logger.info(
             "Initializing a V0 LLM engine (v%s) with config: %s, "
@@ -401,6 +403,20 @@ class LLMEngine:
             self.tracer = init_tracer(
                 "vllm.llm_engine",
                 self.observability_config.otlp_traces_endpoint)
+
+        # Initialize power management if enabled
+        if self.power_management_config.enabled:
+            from vllm.power_management import initialize_power_manager
+            self.power_manager = initialize_power_manager(
+                enabled=self.power_management_config.enabled,
+                decode_clock_reduction_percent=self.power_management_config.
+                decode_clock_reduction_percent,
+                monitor_tbt=self.power_management_config.monitor_tbt,
+                tbt_threshold_ms=self.power_management_config.tbt_threshold_ms,
+                device_ids=self.power_management_config.device_ids,
+            )
+        else:
+            self.power_manager = None
 
         # Create sequence output processor, e.g. for beam search or
         # speculative decoding.
@@ -1152,6 +1168,13 @@ class LLMEngine:
             seq_group = scheduled_seq_group.seq_group
             seq_group.maybe_set_first_token_time(now)
             if not seq_group.is_prefill():
+                # Record time between tokens for power management
+                last_token_time = seq_group.get_last_token_time()
+                if last_token_time is not None and self.power_manager is not None:
+                    tbt_ms = (now - last_token_time
+                              ) * 1000  # Convert to milliseconds
+                    from vllm.power_management import record_tbt
+                    record_tbt(tbt_ms)
                 seq_group.set_last_token_time(now)
             request_output = RequestOutputFactory.create(
                 seq_group,
@@ -1196,6 +1219,13 @@ class LLMEngine:
             seq_group = scheduled_seq_group.seq_group
             seq_group.maybe_set_first_token_time(now)
             if not seq_group.is_prefill():
+                # Record time between tokens for power management
+                last_token_time = seq_group.get_last_token_time()
+                if last_token_time is not None and self.power_manager is not None:
+                    tbt_ms = (now - last_token_time
+                              ) * 1000  # Convert to milliseconds
+                    from vllm.power_management import record_tbt
+                    record_tbt(tbt_ms)
                 seq_group.set_last_token_time(now)
             request_output = RequestOutputFactory.create(
                 seq_group,
@@ -1428,6 +1458,20 @@ class LLMEngine:
                     virtual_engine]
 
             try:
+                # Check if we need to adjust GPU clocks based on prefill/decode phase
+                if self.power_manager is not None:
+                    # Check if this is a prefill or decode phase
+                    is_prefill = any(meta.is_prompt
+                                     for meta in seq_group_metadata_list)
+                    if is_prefill:
+                        # Entering prefill phase - reset clocks to full power
+                        from vllm.power_management import enter_prefill_phase
+                        enter_prefill_phase()
+                    else:
+                        # Entering decode phase - reduce clocks to save power
+                        from vllm.power_management import enter_decode_phase
+                        enter_decode_phase()
+
                 outputs = self.model_executor.execute_model(
                     execute_model_req=execute_model_req)
                 self._skip_scheduling_next_step = False

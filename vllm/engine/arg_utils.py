@@ -21,10 +21,10 @@ from vllm.config import (CacheConfig, CompilationConfig, ConfigFormat,
                          DistributedExecutorBackend, HfOverrides,
                          KVTransferConfig, LoadConfig, LoadFormat, LoRAConfig,
                          ModelConfig, ModelImpl, ObservabilityConfig,
-                         ParallelConfig, PoolerConfig, PromptAdapterConfig,
-                         SchedulerConfig, SchedulerPolicy, SpeculativeConfig,
-                         TaskOption, TokenizerPoolConfig, VllmConfig,
-                         get_attr_docs)
+                         ParallelConfig, PoolerConfig, PowerManagementConfig,
+                         PromptAdapterConfig, SchedulerConfig, SchedulerPolicy,
+                         SpeculativeConfig, TaskOption, TokenizerPoolConfig,
+                         VllmConfig, get_attr_docs)
 from vllm.executor.executor_base import ExecutorBase
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
@@ -248,6 +248,13 @@ class EngineArgs:
     enable_reasoning: Optional[bool] = None
     reasoning_parser: Optional[str] = None
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
+
+    # Power management arguments
+    enable_power_management: bool = False
+    power_decode_clock_reduction_percent: int = 30
+    power_monitor_tbt: bool = True
+    power_tbt_threshold_ms: float = 100.0
+    power_device_ids: Optional[List[int]] = None
 
     def __post_init__(self):
         if not self.tokenizer:
@@ -1021,6 +1028,42 @@ class EngineArgs:
             "using. This is used to parse the reasoning content into OpenAI "
             "API format. Required for ``--enable-reasoning``.")
 
+        # Power management arguments
+        power_group = parser.add_argument_group(
+            title="Power Management",
+            description=
+            "Configuration for GPU power management during inference.")
+        power_group.add_argument(
+            "--enable-power-management",
+            action="store_true",
+            help=
+            "Enable GPU power management to save power during decode phase.")
+        power_group.add_argument(
+            "--power-decode-clock-reduction-percent",
+            type=int,
+            default=30,
+            help="Percentage to reduce SM clock during decode phase (0-100).")
+        power_group.add_argument(
+            "--power-monitor-tbt",
+            action="store_true",
+            default=True,
+            help=
+            "Monitor Time-Between-Tokens and adjust clocks if it exceeds threshold."
+        )
+        power_group.add_argument(
+            "--power-tbt-threshold-ms",
+            type=float,
+            default=100.0,
+            help="Threshold in milliseconds for acceptable Time-Between-Tokens."
+        )
+        power_group.add_argument(
+            "--power-device-ids",
+            type=str,
+            default=None,
+            help=
+            "Comma-separated list of GPU device IDs to manage. If not specified, manage all available GPUs."
+        )
+
         parser.add_argument(
             "--disable-cascade-attn",
             action="store_true",
@@ -1346,6 +1389,31 @@ class EngineArgs:
             or "all" in detailed_trace_modules,
         )
 
+        # Create power management config if enabled
+        power_management_config = None
+        if self.enable_power_management:
+            # Parse device IDs if provided
+            device_ids = None
+            if self.power_device_ids is not None:
+                try:
+                    device_ids = [
+                        int(id.strip())
+                        for id in self.power_device_ids.split(',')
+                    ]
+                except ValueError:
+                    raise ValueError(
+                        "power-device-ids must be a comma-separated list of integers"
+                    )
+
+            power_management_config = PowerManagementConfig(
+                enabled=self.enable_power_management,
+                decode_clock_reduction_percent=self.
+                power_decode_clock_reduction_percent,
+                monitor_tbt=self.power_monitor_tbt,
+                tbt_threshold_ms=self.power_tbt_threshold_ms,
+                device_ids=device_ids,
+            )
+
         config = VllmConfig(
             model_config=model_config,
             cache_config=cache_config,
@@ -1357,6 +1425,7 @@ class EngineArgs:
             load_config=load_config,
             decoding_config=decoding_config,
             observability_config=observability_config,
+            power_management_config=power_management_config,
             prompt_adapter_config=prompt_adapter_config,
             compilation_config=self.compilation_config,
             kv_transfer_config=self.kv_transfer_config,
@@ -1763,7 +1832,7 @@ def _warn_or_fallback(feature_name: str) -> bool:
 def human_readable_int(value):
     """Parse human-readable integers like '1k', '2M', etc.
     Including decimal values with decimal multipliers.
-    
+
     Examples:
     - '1k' -> 1,000
     - '1K' -> 1,024

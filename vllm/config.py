@@ -16,8 +16,8 @@ from dataclasses import (MISSING, dataclass, field, fields, is_dataclass,
                          replace)
 from importlib.util import find_spec
 from pathlib import Path
-from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Final, Literal,
-                    Optional, Protocol, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Final, List,
+                    Literal, Optional, Protocol, TypeVar, Union)
 
 import torch
 from pydantic import BaseModel, Field, PrivateAttr
@@ -121,7 +121,7 @@ def get_attr_docs(cls: type[Any]) -> dict[str, str]:
     def pairwise(iterable):
         """
         Manually implement https://docs.python.org/3/library/itertools.html#itertools.pairwise
-        
+
         Can be removed when Python 3.9 support is dropped.
         """
         iterator = iter(iterable)
@@ -250,7 +250,7 @@ class ModelConfig:
         config_format: The config format which shall be loaded.
             Defaults to 'auto' which defaults to 'hf'.
         hf_token: The token to use as HTTP bearer authorization for remote files
-            . If `True`, will use the token generated when running 
+            . If `True`, will use the token generated when running
             `huggingface-cli login` (stored in `~/.huggingface`).
         hf_overrides: If a dictionary, contains arguments to be forwarded to the
             HuggingFace config. If a callable, it is called to update the
@@ -1582,7 +1582,7 @@ class ParallelConfig:
     """The full name of the worker class to use. If "auto", the worker class
     will be determined based on the platform."""
     sd_worker_cls: str = "auto"
-    """The full name of the worker class to use for speculative decofing. 
+    """The full name of the worker class to use for speculative decofing.
     If "auto", the worker class will be determined based on the platform."""
     worker_extension_cls: str = ""
     """The full name of the worker extension class to use. The worker extension
@@ -1773,13 +1773,13 @@ class SchedulerConfig:
 
     max_num_batched_tokens: int = None  # type: ignore
     """Maximum number of tokens to be processed in a single iteration.
-    
+
     This config has no static default. If left unspecified by the user, it will
     be set in `EngineArgs.create_engine_config` based on the usage context."""
 
     max_num_seqs: int = None  # type: ignore
     """Maximum number of sequences to be processed in a single iteration.
-    
+
     This config has no static default. If left unspecified by the user, it will
     be set in `EngineArgs.create_engine_config` based on the usage context."""
 
@@ -1825,7 +1825,7 @@ class SchedulerConfig:
     # TODO (ywang96): Make this configurable.
     max_num_encoder_input_tokens: int = field(init=False)
     """Multimodal encoder compute budget, only used in V1.
-    
+
     NOTE: This is not currently configurable. It will be overridden by
     max_num_batched_tokens in case max multimodal embedding size is larger."""
 
@@ -3093,6 +3093,52 @@ class DecodingConfig:
 
 
 @dataclass
+class PowerManagementConfig:
+    """Configuration for GPU power management during inference."""
+    enabled: bool = False
+    """Whether to enable GPU power management."""
+
+    decode_clock_reduction_percent: int = 30
+    """Percentage to reduce SM clock during decode phase (0-100)."""
+
+    monitor_tbt: bool = True
+    """Whether to monitor Time-Between-Tokens and adjust clocks if it exceeds threshold."""
+
+    tbt_threshold_ms: float = 100.0
+    """Threshold in milliseconds for acceptable Time-Between-Tokens."""
+
+    device_ids: Optional[List[int]] = None
+    """List of GPU device IDs to manage. If None, manage all available GPUs."""
+
+    def compute_hash(self) -> str:
+        """
+        WARNING: Whenever a new field is added to this config,
+        ensure that it is included in the factors list if
+        it affects the computation graph.
+
+        Provide a hash that uniquely identifies all the configs
+        that affect the structure of the computation
+        graph from input ids/embeddings to the final hidden states,
+        excluding anything before input ids/embeddings and after
+        the final hidden states.
+        """
+        # no factors to consider.
+        # this config will not affect the computation graph.
+        factors: list[Any] = []
+        hash_str = hashlib.md5(str(factors).encode(),
+                               usedforsecurity=False).hexdigest()
+        return hash_str
+
+    def __post_init__(self):
+        if self.decode_clock_reduction_percent < 0 or self.decode_clock_reduction_percent > 100:
+            raise ValueError(
+                "decode_clock_reduction_percent must be between 0 and 100")
+
+        if self.tbt_threshold_ms <= 0:
+            raise ValueError("tbt_threshold_ms must be greater than 0")
+
+
+@dataclass
 class ObservabilityConfig:
     """Configuration for observability - metrics and tracing."""
     show_hidden_metrics: bool = False
@@ -3580,6 +3626,7 @@ class VllmConfig:
                                                   init=True)  # type: ignore
     decoding_config: Optional[DecodingConfig] = None
     observability_config: Optional[ObservabilityConfig] = None
+    power_management_config: Optional[PowerManagementConfig] = None
     prompt_adapter_config: Optional[PromptAdapterConfig] = None
     quant_config: Optional[QuantizationConfig] = None
     compilation_config: CompilationConfig = field(default=None,
@@ -3655,6 +3702,10 @@ class VllmConfig:
             vllm_factors.append("None")
         if self.observability_config:
             vllm_factors.append(self.observability_config.compute_hash())
+        else:
+            vllm_factors.append("None")
+        if self.power_management_config:
+            vllm_factors.append(self.power_management_config.compute_hash())
         else:
             vllm_factors.append("None")
         if self.prompt_adapter_config:
@@ -3919,6 +3970,7 @@ class VllmConfig:
             f" device_config={self.device_config.device}, "
             f"decoding_config={self.decoding_config!r}, "
             f"observability_config={self.observability_config!r}, "
+            f"power_management_config={self.power_management_config!r}, "
             f"seed={self.model_config.seed}, "
             f"served_model_name={self.model_config.served_model_name}, "
             f"num_scheduler_steps={self.scheduler_config.num_scheduler_steps}, "
