@@ -33,7 +33,8 @@ from vllm.config.cache import (BlockSize, CacheConfig, CacheDType,
                                PrefixCachingHashAlgo)
 from vllm.config.compilation import (CompilationConfig, CompilationLevel,
                                      PassConfig)
-from vllm.config.parallel import DistributedExecutorBackend, ParallelConfig
+from vllm.config.parallel import (DistributedExecutorBackend, EPLBConfig,
+                                  ParallelConfig)
 from vllm.config.utils import ConfigType, config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import QuantizationMethods
