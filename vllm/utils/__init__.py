@@ -2046,6 +2046,10 @@ class FlexibleArgumentParser(ArgumentParser):
             if isinstance(value, bool) and key not in store_boolean_arguments:
                 if value:
                     processed_args.append('--' + key)
+            elif isinstance(value, list):
+                processed_args.append('--' + key)
+                for item in value:
+                    processed_args.append(str(item))
             else:
                 processed_args.append('--' + key)
                 processed_args.append(str(value))
