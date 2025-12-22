@@ -18,15 +18,18 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEActivationFormat,
     FusedMoEPermuteExpertsUnpermute,
     FusedMoEPrepareAndFinalize,
 )
+from vllm.model_executor.layers.fused_moe.sonic_moe import sonic_moe
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
 from vllm.utils.flashinfer import has_flashinfer_cutlass_fused_moe
+from vllm.utils.sonic_moe import has_sonic_moe
 
 if current_platform.is_cuda_alike():
     from .fused_batched_moe import BatchedTritonExperts
@@ -56,6 +59,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             self.rocm_aiter_fused_experts = rocm_aiter_fused_experts
         else:
             self.rocm_aiter_fused_experts = None  # type: ignore
+
+        self.sonic_moe_enabled = (
+            envs.VLLM_USE_SONIC_MOE
+            and has_sonic_moe()
+            and current_platform.is_cuda()
+            and current_platform.get_device_capability()[0] >= 9
+            and not self.moe.moe_parallel_config.use_ep
+            and self.moe.moe_parallel_config.dp_size == 1
+        )
+        if self.sonic_moe_enabled:
+            logger.info_once("Enabling SonicMoE for UnquantizedFusedMoEMethod")
 
         # FlashInfer CUTLASS MoE is only supported on Hopper and later GPUS
         self.flashinfer_cutlass_moe_enabled = (
@@ -98,6 +112,68 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     scope="local",
                 )
             self.flashinfer_cutlass_moe = None  # type: ignore
+
+    def _sonic_moe_supported(
+        self, layer: FusedMoE, hidden_states: torch.Tensor
+    ) -> bool:
+        if not self.sonic_moe_enabled:
+            return False
+        if not hidden_states.is_cuda:
+            return False
+        if not layer.moe_config.is_act_and_mul:
+            return False
+        if layer.moe_config.is_lora_enabled:
+            return False
+        if layer.activation != "silu":
+            return False
+        if hidden_states.dtype not in (torch.float16, torch.bfloat16):
+            return False
+        if layer.use_grouped_topk or layer.custom_routing_function is not None:
+            return False
+        if layer.scoring_func != "softmax":
+            return False
+        return not layer.expert_map is not None
+
+    def _get_sonicmoe_weights(
+        self, layer: FusedMoE
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        w13_bias = getattr(layer, "w13_bias", None)
+        w13_bias_ptr = w13_bias.data_ptr() if w13_bias is not None else None
+        cache = getattr(layer, "_sonicmoe_weight_cache", None)
+        if cache is not None:
+            w13_ptr, w2_ptr, w13_bias_ptr_cached, w1, w2, w1_bias = cache
+            if (
+                w13_ptr == layer.w13_weight.data_ptr()
+                and w2_ptr == layer.w2_weight.data_ptr()
+                and w13_bias_ptr_cached == w13_bias_ptr
+            ):
+                return w1, w2, w1_bias
+        # SonicMoE expects swiglu gates interleaved (g0,u0,...) not concatenated.
+        w13_gate, w13_up = torch.chunk(layer.w13_weight, 2, dim=1)
+        w13_interleaved = torch.stack((w13_gate, w13_up), dim=2).reshape(
+            layer.w13_weight.size(0),
+            layer.w13_weight.size(1),
+            layer.w13_weight.size(2),
+        )
+        w1 = w13_interleaved.permute(1, 2, 0)
+        w2 = layer.w2_weight.permute(1, 2, 0)
+        if w13_bias is None:
+            w1_bias = None
+        else:
+            bias_gate, bias_up = torch.chunk(w13_bias, 2, dim=1)
+            w1_bias = torch.stack((bias_gate, bias_up), dim=2).reshape(
+                w13_bias.size(0),
+                w13_bias.size(1),
+            )
+        layer._sonicmoe_weight_cache = (
+            layer.w13_weight.data_ptr(),
+            layer.w2_weight.data_ptr(),
+            w13_bias_ptr,
+            w1,
+            w2,
+            w1_bias,
+        )
+        return w1, w2, w1_bias
 
     @property
     def supports_eplb(self) -> bool:
@@ -308,6 +384,23 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 expert_map=layer.expert_map,
+                activation=layer.activation,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            )
+        elif self._sonic_moe_supported(layer, x):
+            if layer.apply_router_weight_on_input and layer.top_k != 1:
+                raise ValueError(
+                    "SonicMoE only supports apply_router_weight_on_input when topk=1."
+                )
+            w1, w2, w1_bias = self._get_sonicmoe_weights(layer)
+            result = sonic_moe(
+                hidden_states=x,
+                w1=w1,
+                w2=w2,
+                w1_bias=w1_bias,
+                w2_bias=getattr(layer, "w2_bias", None),
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
                 activation=layer.activation,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
             )
