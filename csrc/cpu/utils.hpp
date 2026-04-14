@@ -30,17 +30,17 @@ struct VecTypeTrait<float> {
   using vec_t = vec_op::FP32Vec16;
 };
 
-#if !defined(__aarch64__) || defined(ARM_BF16_SUPPORT)
 template <>
 struct VecTypeTrait<c10::BFloat16> {
   using vec_t = vec_op::BF16Vec16;
 };
-#endif
 
+#if !defined(__powerpc__)
 template <>
 struct VecTypeTrait<c10::Half> {
   using vec_t = vec_op::FP16Vec16;
 };
+#endif
 
 struct Counter {
   std::atomic<int64_t> counter;
@@ -55,7 +55,8 @@ struct Counter {
 
 inline int64_t get_available_l2_size() {
   static int64_t size = []() {
-    const uint32_t l2_cache_size = at::cpu::L2_cache_size();
+    auto caps = at::cpu::get_cpu_capabilities();
+    const uint32_t l2_cache_size = caps.at("l2_cache_size").toInt();
     return l2_cache_size >> 1;  // use 50% of L2 cache
   }();
   return size;

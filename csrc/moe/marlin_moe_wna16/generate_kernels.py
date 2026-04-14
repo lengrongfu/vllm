@@ -58,7 +58,7 @@ TEMPLATE = (
     "( MARLIN_KERNEL_PARAMS );"
 )
 
-THREAD_CONFIGS = [(128, 128, 256), (64, 256, 256), (64, 128, 128)]
+THREAD_CONFIGS = [(128, 128, 256), (64, 256, 256), (64, 128, 128), (128, 64, 128)]
 
 THREAD_M_BLOCKS = [0.5, 1, 2, 3, 4]
 
@@ -103,6 +103,15 @@ QUANT_CONFIGS = [
     {
         "a_type": ["kBFloat16"],
         "b_type": "kFE2M1f",
+        "s_type": "kFE8M0fnu",
+        "thread_configs": THREAD_CONFIGS,
+        "thread_m_blocks": THREAD_M_BLOCKS,
+        "group_blocks": [2],
+    },
+    # MXFP8
+    {
+        "a_type": ["kBFloat16"],
+        "b_type": "kFE4M3fn",
         "s_type": "kFE8M0fnu",
         "thread_configs": THREAD_CONFIGS,
         "thread_m_blocks": THREAD_M_BLOCKS,
