@@ -15,16 +15,21 @@
 #include <torch/all.h>
 namespace vec_op {
 
-#ifdef RISCV_BF16_SUPPORT
-  #define VLLM_DISPATCH_CASE_FLOATING_TYPES(...)         \
-    AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__) \
-    AT_DISPATCH_CASE(at::ScalarType::Half, __VA_ARGS__)  \
-    AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__)
-#else
-  #define VLLM_DISPATCH_CASE_FLOATING_TYPES(...)         \
-    AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__) \
-    AT_DISPATCH_CASE(at::ScalarType::Half, __VA_ARGS__)
-#endif
+// FP8 KV cache is not supported on RISC-V. These tag types and the
+// corresponding BF16Vec32 stub constructors below exist solely so that
+// templates referencing vec_op::fp8_*_tag in their bodies (e.g. in
+// cpu_attn_vec.hpp) compile under GCC's -Wtemplate-body lookup. The
+// stubs are never instantiated by CPU_ATTN_DISPATCH on __riscv.
+struct fp8_e4m3_tag {};
+struct fp8_e5m2_tag {};
+
+// BFloat16 is always supported on RISC-V: natively when __riscv_zvfbfmin
+// is defined (compiler-provided when -march includes zvfbfmin), otherwise
+// via the FP32-simulation fallback path.
+#define VLLM_DISPATCH_CASE_FLOATING_TYPES(...)         \
+  AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__) \
+  AT_DISPATCH_CASE(at::ScalarType::Half, __VA_ARGS__)  \
+  AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__)
 
 #define VLLM_DISPATCH_FLOATING_TYPES(TYPE, NAME, ...) \
   AT_DISPATCH_SWITCH(TYPE, NAME, VLLM_DISPATCH_CASE_FLOATING_TYPES(__VA_ARGS__))
@@ -89,6 +94,10 @@ struct FP16Vec16 : public Vec<FP16Vec16> {
       : reg(RVVI(__riscv_vle16_v_f16, LMUL_256)(
             static_cast<const _Float16*>(ptr), VEC_ELEM_NUM)) {};
 
+  explicit FP16Vec16(const c10::Half v)
+      : reg(RVVI4(__riscv_vreinterpret_v_u16, LMUL_256, _f16, LMUL_256)(
+            RVVI(__riscv_vmv_v_x_u16, LMUL_256)(v.x, VEC_ELEM_NUM))) {};
+
   explicit FP16Vec16(const FP32Vec16& vec);
 
   void save(void* ptr) const {
@@ -110,7 +119,7 @@ struct FP16Vec16 : public Vec<FP16Vec16> {
 // BF16 Implementation
 // ============================================================================
 
-#ifdef RISCV_BF16_SUPPORT
+#ifdef __riscv_zvfbfmin
 
 FORCE_INLINE fixed_u16x8_t bf16_to_u16(fixed_bf16x8_t v) {
   return RVVI4(__riscv_vreinterpret_v_bf16, LMUL_128, _u16, LMUL_128)(v);
@@ -160,6 +169,9 @@ struct BF16Vec16 : public Vec<BF16Vec16> {
             reinterpret_cast<const uint16_t*>(ptr), VEC_ELEM_NUM))) {};
 
   explicit BF16Vec16(fixed_bf16x16_t data) : reg(data) {};
+  explicit BF16Vec16(const c10::BFloat16 v)
+      : reg(RVVI4(__riscv_vreinterpret_v_u16, LMUL_256, _bf16, LMUL_256)(
+            RVVI(__riscv_vmv_v_x_u16, LMUL_256)(v.x, VEC_ELEM_NUM))) {};
   explicit BF16Vec16(const FP32Vec16&);
 
   void save(void* ptr) const {
@@ -188,6 +200,13 @@ struct BF16Vec32 : public Vec<BF16Vec32> {
             reinterpret_cast<const uint16_t*>(ptr), VEC_ELEM_NUM))) {};
 
   explicit BF16Vec32(fixed_bf16x32_t data) : reg(data) {};
+
+  // FP8 KV cache stubs: never instantiated on RISC-V (CPU_ATTN_DISPATCH
+  // omits FP8 cases on __riscv); exist only so name lookup succeeds.
+  explicit BF16Vec32(const uint8_t* ptr, fp8_e4m3_tag)
+      : BF16Vec32(static_cast<const void*>(ptr)) {}
+  explicit BF16Vec32(const uint8_t* ptr, fp8_e5m2_tag)
+      : BF16Vec32(static_cast<const void*>(ptr)) {}
 
   explicit BF16Vec32(const BF16Vec8& v) {
     fixed_u16x8_t u16_val = bf16_to_u16(v.reg);
@@ -278,6 +297,9 @@ struct BF16Vec16 : public Vec<BF16Vec16> {
     }
     reg_fp32 = RVVI(__riscv_vle32_v_f32, LMUL_512)(tmp, 16);
   }
+  explicit BF16Vec16(const c10::BFloat16 v)
+      : reg_fp32(RVVI(__riscv_vfmv_v_f_f32, LMUL_512)(static_cast<float>(v),
+                                                      VEC_ELEM_NUM)) {}
   explicit BF16Vec16(const FP32Vec16&);
   void save(void* ptr) const {
     float tmp[16];
@@ -326,6 +348,13 @@ struct BF16Vec32 : public Vec<BF16Vec32> {
     }
     reg_fp32 = RVVI(__riscv_vle32_v_f32, LMUL_1024)(tmp, 32);
   }
+
+  // FP8 KV cache stubs: never instantiated on RISC-V (CPU_ATTN_DISPATCH
+  // omits FP8 cases on __riscv); exist only so name lookup succeeds.
+  explicit BF16Vec32(const uint8_t* ptr, fp8_e4m3_tag)
+      : BF16Vec32(static_cast<const void*>(ptr)) {}
+  explicit BF16Vec32(const uint8_t* ptr, fp8_e5m2_tag)
+      : BF16Vec32(static_cast<const void*>(ptr)) {}
 
   explicit BF16Vec32(const BF16Vec8& v) {
     float tmp_small[8];
@@ -414,7 +443,7 @@ struct FP32Vec8 : public Vec<FP32Vec8> {
   explicit FP32Vec8(fixed_fp16x8_t v)
       : reg(RVVI(__riscv_vfwcvt_f_f_v_f32, LMUL_256)(v, VEC_ELEM_NUM)) {};
 
-#ifdef RISCV_BF16_SUPPORT
+#ifdef __riscv_zvfbfmin
   explicit FP32Vec8(fixed_bf16x8_t v)
       : reg(RVVI(__riscv_vfwcvtbf16_f_f_v_f32, LMUL_256)(v, VEC_ELEM_NUM)) {};
   explicit FP32Vec8(const BF16Vec8& v)
@@ -486,9 +515,18 @@ struct FP32Vec8 : public Vec<FP32Vec8> {
   }
 
   FP32Vec8 exp() const {
+    // Clamp input to prevent NaN: exp(-inf) must return 0, not NaN.
+    // Without clamping, -inf * 0.0 = NaN in the final poly * scale step.
+    // Matches the clamping strategy used by x86 AVX-512 and ARM NEON.
+    constexpr float exp_lo = -87.3365447505f;  // ln(FLT_MIN)
+    constexpr float exp_hi = 88.7228391117f;   // ln(FLT_MAX)
+    fixed_fp32x8_t x = RVVI(__riscv_vfmin_vf_f32, LMUL_256)(
+        RVVI(__riscv_vfmax_vf_f32, LMUL_256)(reg, exp_lo, VEC_ELEM_NUM), exp_hi,
+        VEC_ELEM_NUM);
+
     const float inv_ln2 = 1.44269504088896341f;
     fixed_fp32x8_t x_scaled =
-        RVVI(__riscv_vfmul_vf_f32, LMUL_256)(reg, inv_ln2, VEC_ELEM_NUM);
+        RVVI(__riscv_vfmul_vf_f32, LMUL_256)(x, inv_ln2, VEC_ELEM_NUM);
     fixed_i32x8_t n_int =
         RVVI(__riscv_vfcvt_x_f_v_i32, LMUL_256)(x_scaled, VEC_ELEM_NUM);
     fixed_fp32x8_t n_float =
@@ -601,9 +639,22 @@ struct FP32Vec16 : public Vec<FP32Vec16> {
       : reg(RVVI4(__riscv_vcreate_v_f32, LMUL_256, _f32, LMUL_512)(
             data.reg, data.reg)) {};
   explicit FP32Vec16(const FP32Vec16& data) : reg(data.reg) {};
+  explicit FP32Vec16(int64_t value, const FP32Vec16& lut) {
+    const uint64_t q_values = static_cast<uint64_t>(value);
+    auto packed = RVVI(__riscv_vmv_v_x_u64, LMUL_1024)(q_values, VEC_ELEM_NUM);
+    auto lane_ids = RVVI(__riscv_vid_v_u64, LMUL_1024)(VEC_ELEM_NUM);
+    auto shifts =
+        RVVI(__riscv_vsll_vx_u64, LMUL_1024)(lane_ids, 2, VEC_ELEM_NUM);
+    auto shifted =
+        RVVI(__riscv_vsrl_vv_u64, LMUL_1024)(packed, shifts, VEC_ELEM_NUM);
+    auto idx64 =
+        RVVI(__riscv_vand_vx_u64, LMUL_1024)(shifted, 0xF, VEC_ELEM_NUM);
+    auto idx32 = RVVI(__riscv_vnsrl_wx_u32, LMUL_512)(idx64, 0, VEC_ELEM_NUM);
+    reg = RVVI(__riscv_vrgather_vv_f32, LMUL_512)(lut.reg, idx32, VEC_ELEM_NUM);
+  }
   explicit FP32Vec16(const FP16Vec16& v);
 
-#ifdef RISCV_BF16_SUPPORT
+#ifdef __riscv_zvfbfmin
   explicit FP32Vec16(fixed_bf16x16_t v)
       : reg(RVVI(__riscv_vfwcvtbf16_f_f_v_f32, LMUL_512)(v, VEC_ELEM_NUM)) {};
   explicit FP32Vec16(const BF16Vec16& v)
@@ -612,6 +663,10 @@ struct FP32Vec16 : public Vec<FP32Vec16> {
 #else
   explicit FP32Vec16(const BF16Vec16& v) : reg(v.reg_fp32) {};
 #endif
+
+  // FP8 stub: dead code on RISC-V (fp8 KV cache is x86-only), needed for
+  // load_b_pair_vec template to compile on all platforms.
+  explicit FP32Vec16(const BF16Vec32&, int) : FP32Vec16() {}
 
   FP32Vec16 operator+(const FP32Vec16& b) const {
     return FP32Vec16(
@@ -706,9 +761,18 @@ struct FP32Vec16 : public Vec<FP32Vec16> {
   }
 
   FP32Vec16 exp() const {
+    // Clamp input to prevent NaN: exp(-inf) must return 0, not NaN.
+    // Without clamping, -inf * 0.0 = NaN in the final poly * scale step.
+    // Matches the clamping strategy used by x86 AVX-512 and ARM NEON.
+    constexpr float exp_lo = -87.3365447505f;  // ln(FLT_MIN)
+    constexpr float exp_hi = 88.7228391117f;   // ln(FLT_MAX)
+    fixed_fp32x16_t x = RVVI(__riscv_vfmin_vf_f32, LMUL_512)(
+        RVVI(__riscv_vfmax_vf_f32, LMUL_512)(reg, exp_lo, VEC_ELEM_NUM), exp_hi,
+        VEC_ELEM_NUM);
+
     const float inv_ln2 = 1.44269504088896341f;
     fixed_fp32x16_t x_scaled =
-        RVVI(__riscv_vfmul_vf_f32, LMUL_512)(reg, inv_ln2, VEC_ELEM_NUM);
+        RVVI(__riscv_vfmul_vf_f32, LMUL_512)(x, inv_ln2, VEC_ELEM_NUM);
     fixed_i32x16_t n_int =
         RVVI(__riscv_vfcvt_x_f_v_i32, LMUL_512)(x_scaled, VEC_ELEM_NUM);
     fixed_fp32x16_t n_float =
@@ -854,7 +918,31 @@ inline void fma(FP32Vec16& acc, const FP32Vec16& a, const FP32Vec16& b) {
   acc = acc.fma(a, b);
 }
 
-#ifdef RISCV_BF16_SUPPORT
+template <typename VecT>
+static void interleave_save_16b(const VecT& vec0, const VecT& vec1, void* ptr) {
+  alignas(64) uint16_t values0[VecT::VEC_ELEM_NUM];
+  alignas(64) uint16_t values1[VecT::VEC_ELEM_NUM];
+  vec0.save(values0);
+  vec1.save(values1);
+
+  auto* packed = reinterpret_cast<uint32_t*>(ptr);
+  for (int32_t i = 0; i < VecT::VEC_ELEM_NUM; ++i) {
+    packed[i] = static_cast<uint32_t>(values0[i]) |
+                (static_cast<uint32_t>(values1[i]) << 16);
+  }
+}
+
+static void interleave_save(const FP16Vec16& vec0, const FP16Vec16& vec1,
+                            void* ptr) {
+  interleave_save_16b(vec0, vec1, ptr);
+}
+
+static void interleave_save(const BF16Vec16& vec0, const BF16Vec16& vec1,
+                            void* ptr) {
+  interleave_save_16b(vec0, vec1, ptr);
+}
+
+#ifdef __riscv_zvfbfmin
 template <>
 inline void storeFP32<c10::BFloat16>(float v, c10::BFloat16* ptr) {
   *ptr = static_cast<__bf16>(v);
