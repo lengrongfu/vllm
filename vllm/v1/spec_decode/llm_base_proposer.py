@@ -1008,9 +1008,13 @@ class SpecDecodeBaseProposer:
         if self.method == "mtp":
             # DeepSeek-family MTP (deepseek_mtp.py) recycles the post-final-
             # norm hidden, so its forward returns (logit_hidden,
-            # recycle_hidden). Other MTP families return a single tensor.
-            return "DeepSeekMTPModel" in (
-                self.draft_model_config.hf_config.architectures or []
+            # recycle_hidden). MiniMax-M3 MTP fuses the final residual add
+            # into its final norm and returns (post-norm logit hidden,
+            # pre-norm recycle hidden). Other MTP families return a single
+            # tensor.
+            architectures = self.draft_model_config.hf_config.architectures or []
+            return any(
+                arch in ("DeepSeekMTPModel", "MiniMaxM3MTP") for arch in architectures
             )
         return self.method not in ("mtp", "draft_model", "dflash")
 

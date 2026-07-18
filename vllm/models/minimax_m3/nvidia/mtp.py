@@ -28,6 +28,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
+from .kernels import fused_eh_gemma_norm
 from .model import (
     MiniMAXGemmaRMSNorm,
     MiniMaxM3DecoderLayer,
@@ -69,18 +70,18 @@ class MiniMaxM3MultiTokenPredictorLayer(nn.Module):
         previous_hidden_states: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_index: int = 0,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         assert inputs_embeds is not None
-        # Mask out inputs at position 0, as not needed by MTP.
-        inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
-
-        # Combine the normalized token embeddings with the normalized
-        # previous hidden states.
-        inputs_embeds = self.enorm(inputs_embeds)
-        previous_hidden_states = self.hnorm(previous_hidden_states)
-        hidden_states, _ = self.eh_proj(
-            torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
+        # Fused: zero pos-0 embeds + enorm(embeds) + hnorm(prev) + cat -> [N, 2H].
+        eh_input = fused_eh_gemma_norm(
+            positions,
+            inputs_embeds,
+            previous_hidden_states,
+            self.enorm.weight,
+            self.hnorm.weight,
+            self.enorm.variance_epsilon,
         )
+        hidden_states, _ = self.eh_proj(eh_input)
 
         # Apply transformer layer.
         hidden_states, residual = self.transformer_layer(
@@ -89,8 +90,13 @@ class MiniMaxM3MultiTokenPredictorLayer(nn.Module):
             residual=None,
         )
 
-        hidden_states += residual
-        return hidden_states
+        # Fused add+norm: after this call ``residual`` holds
+        # hidden_states + residual (recycled into the next draft step, same
+        # value the unfused path returned) and ``hidden_states`` the
+        # post-final-norm value consumed by compute_logits without a second
+        # norm.
+        hidden_states, residual = self.final_layernorm(hidden_states, residual)
+        return hidden_states, residual
 
 
 class MiniMaxM3MultiTokenPredictor(nn.Module):
@@ -126,7 +132,7 @@ class MiniMaxM3MultiTokenPredictor(nn.Module):
         previous_hidden_states: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
@@ -168,7 +174,7 @@ class MiniMaxM3MTP(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.model(
             input_ids, positions, hidden_states, inputs_embeds, spec_step_idx
         )
@@ -178,11 +184,9 @@ class MiniMaxM3MTP(nn.Module):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
-        current_step_idx = spec_step_idx % self.model.num_mtp_layers
-        mtp_layer = self.model.layers[str(current_step_idx)]
-        return self.logits_processor(
-            self.lm_head, mtp_layer.final_layernorm(hidden_states)
-        )
+        # hidden_states is already post-final-norm (the norm is fused with the
+        # residual add in the layer forward); apply the LM head only.
+        return self.logits_processor(self.lm_head, hidden_states)
 
     def _get_mtp_layer_idx_from_weight_name(self, name: str) -> int | None:
         """Return the MTP layer index in *.mtp.layers.{idx}.*, else None."""
