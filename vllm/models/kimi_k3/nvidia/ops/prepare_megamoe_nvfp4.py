@@ -60,6 +60,39 @@ def _quantize_e2m1(x):
 
 
 @triton.jit
+def _e2m1_code(v):
+    """Map a signed E2M1 magnitude to its 4-bit code (sign<<3 | magnitude idx).
+
+    Triton doesn't support nested `def`s inside a `@triton.jit` function, so
+    this lives at module scope instead of inline in `_pack_e2m1_to_uint8`.
+    """
+    s = tl.where(v < 0, 8, 0).to(tl.uint8)
+    av = tl.abs(v)
+    m = tl.where(
+        av < 0.25,
+        0,
+        tl.where(
+            av < 0.75,
+            1,
+            tl.where(
+                av < 1.25,
+                2,
+                tl.where(
+                    av < 1.75,
+                    3,
+                    tl.where(
+                        av < 2.5,
+                        4,
+                        tl.where(av < 3.5, 5, tl.where(av < 5.0, 6, 7)),
+                    ),
+                ),
+            ),
+        ),
+    ).to(tl.uint8)
+    return s | m
+
+
+@triton.jit
 def _pack_e2m1_to_uint8(hi, lo):
     """Pack two E2M1 magnitudes (already sign-folded into {-6..6}) into one byte.
 
@@ -67,34 +100,7 @@ def _pack_e2m1_to_uint8(hi, lo):
     the E2M1 format, derived from a small value->code lookup since there are
     only 16 signed codes).
     """
-
-    def code(v):
-        s = tl.where(v < 0, 8, 0).to(tl.uint8)
-        av = tl.abs(v)
-        m = tl.where(
-            av < 0.25,
-            0,
-            tl.where(
-                av < 0.75,
-                1,
-                tl.where(
-                    av < 1.25,
-                    2,
-                    tl.where(
-                        av < 1.75,
-                        3,
-                        tl.where(
-                            av < 2.5,
-                            4,
-                            tl.where(av < 3.5, 5, tl.where(av < 5.0, 6, 7)),
-                        ),
-                    ),
-                ),
-            ),
-        ).to(tl.uint8)
-        return s | m
-
-    return (code(hi) << 4) | code(lo)
+    return (_e2m1_code(hi) << 4) | _e2m1_code(lo)
 
 
 @triton.jit
