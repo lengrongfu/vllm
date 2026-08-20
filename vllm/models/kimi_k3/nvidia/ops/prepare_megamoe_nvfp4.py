@@ -160,8 +160,12 @@ def _prepare_megamoe_nvfp4_inputs_kernel(
     # NOTE: must be annotated `: tl.constexpr` (like `num_groups` above) or
     # Triton won't treat it as a compile-time int for `tl.reshape`'s shape.
     half: tl.constexpr = BLOCK_K // 2
-    lo = tl.reshape(scaled, [half, 2])[:, 0]
-    hi = tl.reshape(scaled, [half, 2])[:, 1]
+    # Plain integer tensor-axis indexing (`t[:, 0]`) isn't supported by this
+    # Triton version; deinterleave with a one-hot select + sum instead.
+    pair = tl.reshape(scaled, [half, 2])
+    lane = tl.arange(0, 2)[None, :]
+    lo = tl.sum(tl.where(lane == 0, pair, 0.0), axis=1)
+    hi = tl.sum(tl.where(lane == 1, pair, 0.0), axis=1)
     packed = _pack_e2m1_to_uint8(hi, lo)
     byte_offsets = k_block_id * (BLOCK_K // 2) + tl.arange(0, half)
     tl.store(
