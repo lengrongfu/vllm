@@ -157,7 +157,9 @@ def _prepare_megamoe_nvfp4_inputs_kernel(
     scaled = tl.reshape(_quantize_e2m1(tl.reshape(scaled, [BLOCK_K])), [BLOCK_K])
 
     # Pack two adjacent E2M1 values per byte (lo = even index, hi = odd index).
-    half = BLOCK_K // 2
+    # NOTE: must be annotated `: tl.constexpr` (like `num_groups` above) or
+    # Triton won't treat it as a compile-time int for `tl.reshape`'s shape.
+    half: tl.constexpr = BLOCK_K // 2
     lo = tl.reshape(scaled, [half, 2])[:, 0]
     hi = tl.reshape(scaled, [half, 2])[:, 1]
     packed = _pack_e2m1_to_uint8(hi, lo)
