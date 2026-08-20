@@ -103,6 +103,10 @@ from vllm.models.kimi_k3.nvidia.low_latency_gemm import (
     enable_kimi_k3_low_latency_gemm,
 )
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
+from vllm.models.kimi_k3.nvidia.nvfp4_mega_moe import (
+    KimiK3NVFP4MegaMoEExperts,
+    make_kimi_k3_nvfp4_mega_moe_expert_params_mapping,
+)
 from vllm.models.kimi_k3.nvidia.ops import attn_res
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import NestedTensors
@@ -122,6 +126,16 @@ from ..common.mm_preprocess import (
 )
 
 logger = init_logger(__name__)
+
+
+def _is_nvfp4_mega_moe_quant(quant_config: QuantizationConfig | None) -> bool:
+    """True for the native NVFP4 checkpoint format (e.g. nvidia/Kimi-K3-NVFP4,
+    `quant_method: modelopt_mixed`, 16-element E2M1 blocks with E4M3 scales),
+    as opposed to the MXFP4-style block-32/UE8M0 weights the base
+    `KimiK3MegaMoEExperts` (`fp8_fp4_mega_moe`) path expects.
+    """
+    return quant_config is not None and quant_config.get_name() == "modelopt_mixed"
+
 
 # Token-count cutoff for overlapping the MoE router gate with the routed-expert
 # down projection on a separate CUDA stream (latent MoE). At or below this many
@@ -675,7 +689,13 @@ class KimiMoE(nn.Module):
                     f"EP size {ep_size}."
                 )
             num_local_experts = num_experts // ep_size
-            self.experts = KimiK3MegaMoEExperts(
+            self.use_nvfp4_mega_moe = _is_nvfp4_mega_moe_quant(quant_config)
+            experts_cls = (
+                KimiK3NVFP4MegaMoEExperts
+                if self.use_nvfp4_mega_moe
+                else KimiK3MegaMoEExperts
+            )
+            self.experts = experts_cls(
                 vllm_config,
                 num_experts=num_experts,
                 num_local_experts=num_local_experts,
@@ -1442,7 +1462,16 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             for module in self.modules()
             if isinstance(module, KimiMoE)
         )
-        if self.config.is_moe and use_mega_moe:
+        use_nvfp4_mega_moe = any(
+            getattr(module, "use_nvfp4_mega_moe", False)
+            for module in self.modules()
+            if isinstance(module, KimiMoE)
+        )
+        if self.config.is_moe and use_mega_moe and use_nvfp4_mega_moe:
+            expert_params_mapping = make_kimi_k3_nvfp4_mega_moe_expert_params_mapping(
+                self.config.num_experts
+            )
+        elif self.config.is_moe and use_mega_moe:
             expert_params_mapping = make_kimi_k3_mega_moe_expert_params_mapping(
                 self.config.num_experts
             )
