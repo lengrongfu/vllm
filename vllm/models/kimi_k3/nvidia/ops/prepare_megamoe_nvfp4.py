@@ -20,11 +20,13 @@ import torch
 from vllm.triton_utils import tl, triton
 
 # E2M1 has 8 representable magnitudes: 0, 0.5, 1, 1.5, 2, 3, 4, 6.
-_E2M1_MAX = 6.0
-_E2M1_MAX_INV = 1.0 / 6.0
+# Must be `tl.constexpr` (not a plain Python global) to be visible inside
+# @triton.jit kernels below.
+_E2M1_MAX = tl.constexpr(6.0)
+_E2M1_MAX_INV = tl.constexpr(1.0 / 6.0)
 # Smallest representable E4M3 magnitude (subnormal), used as an SF floor so
 # near-zero blocks don't quantize their scale to exact zero.
-_E4M3_MIN_SF = 2.0**-9
+_E4M3_MIN_SF = tl.constexpr(2.0**-9)
 
 
 @triton.jit
