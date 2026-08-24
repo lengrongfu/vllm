@@ -203,6 +203,27 @@ def _import_deep_gemm():
     return None
 
 
+def deep_gemm_supports_sm90_mega_moe() -> bool:
+    """Whether the resolved ``deep_gemm`` module has the SM90 (Hopper)
+    all-FP8 MegaMoE API (``fp8_mega_moe_sm90`` /
+    ``get_symm_buffer_for_sm90_mega_moe`` /
+    ``transform_weights_for_mega_moe_sm90``).
+
+    Not in upstream https://github.com/deepseek-ai/DeepGEMM (SM100 mega_moe
+    only) or on PyPI (the ``deep_gemm``/``deep-gemm`` PyPI packages are
+    unrelated placeholders). Ported from sgl-project/DeepGEMM#36 in
+    https://github.com/lengrongfu/DeepGEMM (branch
+    ``claude/pr36-mega-moe-port``).
+    """
+    dg = _import_deep_gemm()
+    return (
+        dg is not None
+        and hasattr(dg, "fp8_mega_moe_sm90")
+        and hasattr(dg, "get_symm_buffer_for_sm90_mega_moe")
+        and hasattr(dg, "transform_weights_for_mega_moe_sm90")
+    )
+
+
 def _apply_pdl(mod, enable: bool = True) -> None:
     mod_name = getattr(mod, "__name__", str(mod))
     try:
