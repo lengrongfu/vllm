@@ -295,7 +295,8 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
         min_transformers_version="5.0.0",
     ),
     "GlmMoeDsaForCausalLM": _HfExamplesInfo(
-        "zai-org/GLM-5", min_transformers_version="5.0.1", is_available_online=False
+        "zai-org/GLM-5.2-FP8",
+        min_transformers_version="5.0.1",
     ),
     "GPT2LMHeadModel": _HfExamplesInfo("openai-community/gpt2"),
     "GPTBigCodeForCausalLM": _HfExamplesInfo(
@@ -1692,6 +1693,10 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
         "nvidia/DeepSeek-V3.2-NVFP4",
         speculative_model="nvidia/DeepSeek-V3.2-NVFP4",
         is_available_online=False,
+    ),
+    "Glm52MTPModel": _HfExamplesInfo(
+        "zai-org/GLM-5.2-FP8",
+        speculative_model="zai-org/GLM-5.2-FP8",
     ),
     "DeepSeekV4MTPModel": _HfExamplesInfo(
         "deepseek-ai/DeepSeek-V4-Flash",

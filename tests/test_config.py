@@ -226,6 +226,8 @@ def test_dsa_models_default_to_mrv2_and_breakable_cudagraph(
         ("DeepseekV32ForCausalLM", True, False),
         ("DeepseekV32MTPModel", False, True),
         ("DeepseekV32MTPModel", True, False),
+        ("Glm52MTPModel", False, True),
+        ("Glm52MTPModel", True, False),
         ("GlmMoeDsaForCausalLM", False, True),
         ("GlmMoeDsaForCausalLM", True, True),
     ],
@@ -260,7 +262,7 @@ def test_dsa_breakable_cudagraph_platform_default(
     ("model_type", "expected_architecture"),
     [
         ("deepseek_v32", "DeepseekV32MTPModel"),
-        ("glm_moe_dsa", "DeepseekV32MTPModel"),
+        ("glm_moe_dsa", "Glm52MTPModel"),
         ("deepseek_v3", "DeepSeekMTPModel"),
     ],
 )

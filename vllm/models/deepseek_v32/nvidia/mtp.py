@@ -56,6 +56,8 @@ from .model import DeepseekV32DecoderLayer
 
 
 class DeepseekV32MultiTokenPredictorLayer(nn.Module):
+    decoder_layer_cls = DeepseekV32DecoderLayer
+
     def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
@@ -81,7 +83,7 @@ class DeepseekV32MultiTokenPredictorLayer(nn.Module):
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=quant_config
         )
-        self.mtp_block = DeepseekV32DecoderLayer(
+        self.mtp_block = self.decoder_layer_cls(
             vllm_config,
             prefix,
             config=config,
@@ -158,6 +160,8 @@ class DeepseekV32MultiTokenPredictorLayer(nn.Module):
 
 
 class DeepseekV32MultiTokenPredictor(nn.Module):
+    layer_cls = DeepseekV32MultiTokenPredictorLayer
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -165,9 +169,7 @@ class DeepseekV32MultiTokenPredictor(nn.Module):
         self.num_mtp_layers = config.num_nextn_predict_layers
         self.layers = torch.nn.ModuleDict(
             {
-                str(idx): DeepseekV32MultiTokenPredictorLayer(
-                    vllm_config, f"{prefix}.layers.{idx}"
-                )
+                str(idx): self.layer_cls(vllm_config, f"{prefix}.layers.{idx}")
                 for idx in range(
                     self.mtp_start_layer_idx,
                     self.mtp_start_layer_idx + self.num_mtp_layers,
@@ -261,12 +263,18 @@ class DeepseekV32MultiTokenPredictor(nn.Module):
 
 
 class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
+    model_cls = DeepseekV32MultiTokenPredictor
+    routed_experts_prefix = "routed_experts"
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
-        self.model = DeepseekV32MultiTokenPredictor(
+        self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
+        self.num_redundant_experts = (
+            vllm_config.parallel_config.eplb_config.num_redundant_experts
         )
         if self.config.model_type == "glm_moe_dsa":
             enable_glm52_low_latency_gemm(self, vllm_config.model_config.dtype)
@@ -357,6 +365,8 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts,
+            num_redundant_experts=self.num_redundant_experts,
+            routed_experts_prefix=self.routed_experts_prefix,
         )
 
         pp_missing_layer_names = get_pp_missing_layer_names(self)
@@ -462,4 +472,8 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
                     f"MTP speculative decoding layer {layer_idx} weights "
                     f"missing from checkpoint."
                 )
+        self.process_weights_after_loading()
         return loaded_params
+
+    def process_weights_after_loading(self) -> None:
+        pass

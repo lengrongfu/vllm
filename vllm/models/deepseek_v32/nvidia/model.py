@@ -51,6 +51,30 @@ from .glm52_low_latency_gemm import enable_glm52_low_latency_gemm
 
 
 class DeepseekV32DecoderLayer(torch.nn.Module):
+    @classmethod
+    def should_use_sequence_parallel(cls, vllm_config: VllmConfig) -> bool:
+        parallel_config = vllm_config.parallel_config
+        return (
+            parallel_config.use_sequence_parallel_moe
+            and parallel_config.pipeline_parallel_size == 1
+        )
+
+    @classmethod
+    def make_moe(
+        cls,
+        vllm_config: VllmConfig,
+        config,
+        prefix: str,
+    ) -> torch.nn.Module:
+        return DeepseekV2MoE(
+            config=config,
+            parallel_config=vllm_config.parallel_config,
+            quant_config=vllm_config.quant_config,
+            reduce_results=False,
+            prefix=prefix,
+            apply_routed_scale_to_output=False,
+        )
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -63,17 +87,13 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
         if config is None:
             config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
-        parallel_config = vllm_config.parallel_config
 
         self.hidden_size = config.hidden_size
         moe_layer_freq = getattr(config, "moe_layer_freq", 1)
         layer_idx = int(prefix.split(sep=".")[-1])
         self.layer_idx = layer_idx
         self.use_mha = False
-        self.use_sequence_parallel = (
-            parallel_config.use_sequence_parallel_moe
-            and parallel_config.pipeline_parallel_size == 1
-        )
+        self.use_sequence_parallel = self.should_use_sequence_parallel(vllm_config)
 
         self.self_attn = DeepseekV32Attention(
             vllm_config=vllm_config,
@@ -82,21 +102,15 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
             topk_indices_buffer=topk_indices_buffer,
         )
 
-        if (
+        self.is_moe_layer = (
             config.n_routed_experts is not None
             and layer_idx >= config.first_k_dense_replace
             and layer_idx % moe_layer_freq == 0
-        ):
+        )
+        if self.is_moe_layer:
             # Keep the MoE output un-reduced. Non-SP fuses its all-reduce into
             # the next layer norm; SP keeps the token shard local.
-            self.mlp = DeepseekV2MoE(
-                config=config,
-                parallel_config=parallel_config,
-                quant_config=quant_config,
-                reduce_results=False,
-                prefix=f"{prefix}.mlp",
-                apply_routed_scale_to_output=False,
-            )
+            self.mlp = self.make_moe(vllm_config, config, f"{prefix}.mlp")
         else:
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
@@ -153,7 +167,7 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
                 hidden_states, residual, self.post_attention_layernorm
             )
 
-        if self.use_sequence_parallel and isinstance(self.mlp, DeepseekV2MoE):
+        if self.use_sequence_parallel and self.is_moe_layer:
             hidden_states = self.mlp(hidden_states, already_sequence_parallel=True)
         else:
             hidden_states = self.mlp(hidden_states)
@@ -162,6 +176,8 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
 
 class DeepseekV32Model(torch.nn.Module):
     fall_back_to_pt_during_load = False
+    decoder_layer_cls = DeepseekV32DecoderLayer
+    routed_experts_prefix = "routed_experts"
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -176,8 +192,7 @@ class DeepseekV32Model(torch.nn.Module):
         self.vocab_size = config.vocab_size
         parallel_config = vllm_config.parallel_config
         self.use_sequence_parallel = (
-            parallel_config.use_sequence_parallel_moe
-            and parallel_config.pipeline_parallel_size == 1
+            self.decoder_layer_cls.should_use_sequence_parallel(vllm_config)
         )
         # DSA is always sparse (has index_topk); allocate the shared top-k
         # buffer the indexer writes and the sparse MLA backend reads.
@@ -204,7 +219,7 @@ class DeepseekV32Model(torch.nn.Module):
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: DeepseekV32DecoderLayer(
+            lambda prefix: self.decoder_layer_cls(
                 vllm_config=vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
@@ -329,6 +344,7 @@ class DeepseekV32Model(torch.nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts,
             num_redundant_experts=self.num_redundant_experts,
+            routed_experts_prefix=self.routed_experts_prefix,
         )
 
         pp_missing_layer_names = get_pp_missing_layer_names(self)

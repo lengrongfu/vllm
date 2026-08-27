@@ -88,6 +88,7 @@ DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
         "DeepseekV4ForCausalLM",
         "DeepSeekV4MTPModel",
         "GlmMoeDsaForCausalLM",
+        "Glm52MTPModel",
         "InklingForCausalLM",
         "InklingForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
@@ -123,6 +124,7 @@ def default_breakable_cudagraph_architectures() -> frozenset[str]:
         return DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES - {
             "DeepseekV32ForCausalLM",
             "DeepseekV32MTPModel",
+            "Glm52MTPModel",
         }
     return DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES
 

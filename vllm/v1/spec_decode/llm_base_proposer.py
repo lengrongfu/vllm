@@ -1021,6 +1021,7 @@ class SpecDecodeBaseProposer:
                 {
                     "DeepSeekMTPModel",
                     "DeepseekV32MTPModel",
+                    "Glm52MTPModel",
                     "KimiK3MTPModel",
                 }.intersection(architectures)
             )

@@ -13,7 +13,9 @@ from vllm.models.deepseek_v4.nvidia.dspark import DSparkDeepseekV4ForCausalLM
 from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4ForCausalLM,
     DeepseekV4MegaMoEExperts,
+    DeepseekV4MegaMoESM90Experts,
     DeepseekV4MoE,
+    _validate_sm90_mega_moe_topology,
     make_deepseek_v4_expert_params_mapping,
 )
 from vllm.models.deepseek_v4.nvidia.mtp import DeepSeekV4MTP
@@ -49,6 +51,50 @@ def test_deepseek_v4_mega_moe_ue8m0_uint8_to_float():
     assert decoded[1].item() == 0.5
     assert decoded[2].item() == 1.0
     assert decoded[3].item() == 2.0
+
+
+def test_deepseek_v4_sm90_mega_moe_shared_expert_contract():
+    experts = DeepseekV4MegaMoESM90Experts.__new__(DeepseekV4MegaMoESM90Experts)
+    torch.nn.Module.__init__(experts)
+    experts._transformed_l1_weights = (torch.empty(0), torch.empty(0))
+
+    experts.finalize_weights(object())
+
+    assert not experts.has_fused_shared_experts
+
+
+def test_deepseek_v4_sm90_mega_moe_rejects_partial_nvlink(monkeypatch):
+    from vllm.models.deepseek_v4.nvidia import model
+
+    model._validated_sm90_mega_moe_ep_groups.clear()
+    ep_group = SimpleNamespace(
+        cpu_group=object(),
+        device_index=0,
+        world_size=2,
+    )
+    monkeypatch.setattr(model, "get_ep_group", lambda: ep_group)
+    monkeypatch.setattr(
+        current_platform,
+        "logical_device_id_to_visible_device_id",
+        lambda device_id: device_id,
+    )
+    monkeypatch.setattr(
+        current_platform,
+        "visible_device_id_to_physical_device_id",
+        lambda device_id: device_id,
+    )
+    monkeypatch.setattr(
+        current_platform, "is_fully_connected", lambda device_ids: False
+    )
+
+    def all_gather(outputs, input_, group):
+        outputs[0].fill_(input_.item())
+        outputs[1].fill_(2)
+
+    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
+
+    with pytest.raises(RuntimeError, match="fully connected NVLink domain"):
+        _validate_sm90_mega_moe_topology()
 
 
 @pytest.mark.parametrize("use_kimi", [False, True])
