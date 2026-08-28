@@ -117,6 +117,7 @@ class Glm52DeepGemmMegaMoE(nn.Module):
             requires_grad=False,
         )
 
+        self.shared_experts = None
         if self.n_shared_experts:
             self.shared_experts = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
@@ -157,6 +158,8 @@ class Glm52DeepGemmMegaMoE(nn.Module):
             top_k=self.top_k,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
+            num_shared_experts=self.n_shared_experts,
+            fuse_shared_experts=True,
             prefix=f"{prefix}.experts",
         )
 
@@ -182,7 +185,10 @@ class Glm52DeepGemmMegaMoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
         )
         output = self.experts(hidden_states, topk_weights, topk_ids)
-        if self.shared_experts is not None:
+        if (
+            self.shared_experts is not None
+            and not self.experts.has_fused_shared_experts
+        ):
             output += self.shared_experts(hidden_states)
 
         if self.is_sequence_parallel and not already_sequence_parallel:
@@ -190,4 +196,4 @@ class Glm52DeepGemmMegaMoE(nn.Module):
         return output.view(num_tokens, hidden_size)
 
     def finalize_mega_moe_weights(self) -> None:
-        self.experts.finalize_weights()
+        self.experts.finalize_weights(self.shared_experts)

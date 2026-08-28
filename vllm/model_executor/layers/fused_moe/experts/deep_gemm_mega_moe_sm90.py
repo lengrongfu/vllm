@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+import inspect
+
 import torch
 import torch.nn as nn
 
@@ -57,7 +59,7 @@ def validate_sm90_mega_moe_topology(ep_group=None) -> None:
 class DeepGemmMegaMoESM90Experts(nn.Module):
     """Hopper FP8 routed experts backed by DeepGEMM MegaMoE."""
 
-    _symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int], object] = {}
+    _symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int, int], object] = {}
 
     def __init__(
         self,
@@ -72,6 +74,7 @@ class DeepGemmMegaMoESM90Experts(nn.Module):
         prefix: str = "",
         num_logical_experts: int | None = None,
         num_shared_experts: int | None = None,
+        fuse_shared_experts: bool = False,
     ) -> None:
         super().__init__()
         self.prefix = prefix
@@ -85,6 +88,9 @@ class DeepGemmMegaMoESM90Experts(nn.Module):
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.block_size = 128
         self.num_logical_experts = num_logical_experts or num_experts
+        self.num_shared_experts = (
+            (num_shared_experts or 0) if fuse_shared_experts else 0
+        )
         self.eplb_state = EplbLayerState()
 
         weight_attrs = {"weight_loader": self.weight_loader}
@@ -134,6 +140,12 @@ class DeepGemmMegaMoESM90Experts(nn.Module):
 
         self._transformed_l1_weights: tuple[torch.Tensor, torch.Tensor] | None = None
         self._transformed_l2_weights: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._transformed_shared_l1_weights: (
+            tuple[torch.Tensor, torch.Tensor] | None
+        ) = None
+        self._transformed_shared_l2_weights: (
+            tuple[torch.Tensor, torch.Tensor] | None
+        ) = None
         self._cum_local_expert_recv_stats: torch.Tensor | None = None
 
         compilation_config = vllm_config.compilation_config
@@ -214,31 +226,117 @@ class DeepGemmMegaMoESM90Experts(nn.Module):
                 "all-FP8 MegaMoE API."
             )
 
+    def _finalize_shared_expert_weights(
+        self, deep_gemm, shared_experts: nn.Module
+    ) -> None:
+        shared_intermediate_size = self.intermediate_size * self.num_shared_experts
+        gate_up_weight = shared_experts.gate_up_proj.weight
+        gate_up_scale = shared_experts.gate_up_proj.weight_scale_inv
+        down_weight = shared_experts.down_proj.weight
+        down_scale = shared_experts.down_proj.weight_scale_inv
+
+        expected_tensors = (
+            (
+                "gate_up_proj.weight",
+                gate_up_weight,
+                (2 * shared_intermediate_size, self.hidden_size),
+                torch.float8_e4m3fn,
+            ),
+            (
+                "gate_up_proj.weight_scale_inv",
+                gate_up_scale,
+                (
+                    cdiv(2 * shared_intermediate_size, self.block_size),
+                    cdiv(self.hidden_size, self.block_size),
+                ),
+                torch.float32,
+            ),
+            (
+                "down_proj.weight",
+                down_weight,
+                (self.hidden_size, shared_intermediate_size),
+                torch.float8_e4m3fn,
+            ),
+            (
+                "down_proj.weight_scale_inv",
+                down_scale,
+                (
+                    cdiv(self.hidden_size, self.block_size),
+                    cdiv(shared_intermediate_size, self.block_size),
+                ),
+                torch.float32,
+            ),
+        )
+        for name, tensor, expected_shape, expected_dtype in expected_tensors:
+            if tensor.shape != expected_shape or tensor.dtype != expected_dtype:
+                raise ValueError(
+                    f"SM90 MegaMoE shared expert {name} must have shape "
+                    f"{expected_shape} and dtype {expected_dtype}, got "
+                    f"shape={tuple(tensor.shape)} and dtype={tensor.dtype}."
+                )
+
+        shared_l1, shared_l2 = deep_gemm.transform_weights_for_mega_moe_sm90(
+            (gate_up_weight.data, gate_up_scale.data),
+            (down_weight.data, down_scale.data),
+        )
+        gate_up_weight.data = shared_l1[0]
+        self._transformed_shared_l1_weights = (gate_up_weight, shared_l1[1])
+        self._transformed_shared_l2_weights = shared_l2
+
     def finalize_weights(self, shared_experts: nn.Module | None = None) -> None:
-        if self._transformed_l1_weights is not None:
+        num_shared_experts = getattr(self, "num_shared_experts", 0)
+        shared_weights_finalized = (
+            getattr(self, "_transformed_shared_l1_weights", None) is not None
+        )
+        if self._transformed_l1_weights is not None and (
+            num_shared_experts == 0
+            or shared_experts is None
+            or shared_weights_finalized
+        ):
             return
         self._check_runtime_supported()
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         deep_gemm = _import_deep_gemm()
         assert deep_gemm is not None
-        self._transformed_l1_weights, self._transformed_l2_weights = (
-            deep_gemm.transform_weights_for_mega_moe_sm90(
-                (self.w13_weight.data, self.w13_weight_scale_inv.data),
-                (self.w2_weight.data, self.w2_weight_scale_inv.data),
+        if self._transformed_l1_weights is None:
+            self._transformed_l1_weights, self._transformed_l2_weights = (
+                deep_gemm.transform_weights_for_mega_moe_sm90(
+                    (self.w13_weight.data, self.w13_weight_scale_inv.data),
+                    (self.w2_weight.data, self.w2_weight_scale_inv.data),
+                )
             )
-        )
-        self._cum_local_expert_recv_stats = torch.zeros(
-            self.num_local_experts,
-            dtype=torch.int32,
-            device=self.w13_weight.device,
-        )
-        self.w13_weight = None
-        self.w2_weight = None
+            self._cum_local_expert_recv_stats = torch.zeros(
+                self.num_local_experts,
+                dtype=torch.int32,
+                device=self.w13_weight.device,
+            )
+            self.w13_weight = None
+            self.w2_weight = None
+
+        if (
+            num_shared_experts == 0
+            or self._transformed_shared_l1_weights is not None
+            or shared_experts is None
+        ):
+            return
+        buffer_params = inspect.signature(
+            deep_gemm.get_symm_buffer_for_sm90_mega_moe
+        ).parameters
+        kernel_params = inspect.signature(deep_gemm.fp8_mega_moe_sm90).parameters
+        if "num_shared_experts" not in buffer_params or not {
+            "shared_l1_weights",
+            "shared_l2_weights",
+        }.issubset(kernel_params):
+            raise RuntimeError(
+                "The installed DeepGEMM SM90 MegaMoE API does not support fused "
+                "shared experts."
+            )
+        self._finalize_shared_expert_weights(deep_gemm, shared_experts)
 
     @property
     def has_fused_shared_experts(self) -> bool:
-        return False
+        return getattr(self, "_transformed_shared_l1_weights", None) is not None
 
     def get_symm_buffer(self):
         from vllm.utils.deep_gemm import _import_deep_gemm
@@ -255,6 +353,7 @@ class DeepGemmMegaMoESM90Experts(nn.Module):
             self.top_k,
             self.hidden_size,
             self.intermediate_size,
+            self.num_shared_experts,
         )
         symm_buffer = self._symm_buffer_cache.get(key)
         if symm_buffer is None:
@@ -265,6 +364,7 @@ class DeepGemmMegaMoESM90Experts(nn.Module):
                 self.top_k,
                 self.hidden_size,
                 self.intermediate_size,
+                num_shared_experts=self.num_shared_experts,
             )
             self._symm_buffer_cache[key] = symm_buffer
         return symm_buffer
@@ -374,12 +474,19 @@ class DeepGemmMegaMoESM90Experts(nn.Module):
         self.finalize_weights()
         assert self._transformed_l1_weights is not None
         assert self._transformed_l2_weights is not None
+        if self.num_shared_experts and not self.has_fused_shared_experts:
+            raise RuntimeError(
+                "SM90 MegaMoE shared expert weights must be finalized before "
+                "the first forward pass."
+            )
         output = torch.empty_like(hidden_states, dtype=torch.bfloat16)
         deep_gemm.fp8_mega_moe_sm90(
             output,
             self._transformed_l1_weights,
             self._transformed_l2_weights,
             symm_buffer,
+            shared_l1_weights=self._transformed_shared_l1_weights,
+            shared_l2_weights=self._transformed_shared_l2_weights,
             cumulative_local_expert_recv_stats=self._cum_local_expert_recv_stats,
             activation_clamp=activation_clamp,
             fast_math=fast_math,

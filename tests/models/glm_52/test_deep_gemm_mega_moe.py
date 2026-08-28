@@ -69,6 +69,7 @@ def test_glm52_mega_moe_router_and_shared_expert_contract(monkeypatch):
     class Experts(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
+            self.has_fused_shared_experts = True
 
         def forward(self, hidden_states, topk_weights, topk_ids):
             self.inputs = (hidden_states, topk_weights, topk_ids)
@@ -107,7 +108,82 @@ def test_glm52_mega_moe_router_and_shared_expert_contract(monkeypatch):
         == moe.gate.e_score_correction_bias.data_ptr()
     )
     assert moe.experts.inputs == (hidden_states, topk_weights, topk_ids)
-    torch.testing.assert_close(output, 2 * hidden_states + 1)
+    torch.testing.assert_close(output, hidden_states + 1)
+
+
+def test_glm52_mega_moe_finalizes_fused_shared_expert_weights(monkeypatch):
+    from vllm.model_executor.layers.fused_moe.experts import (
+        deep_gemm_mega_moe_sm90 as mega_moe,
+    )
+
+    class FakeDeepGemm:
+        @staticmethod
+        def get_symm_buffer_for_sm90_mega_moe(*args, num_shared_experts=0):
+            return None
+
+        @staticmethod
+        def fp8_mega_moe_sm90(*args, shared_l1_weights=None, shared_l2_weights=None):
+            return None
+
+        @staticmethod
+        def transform_weights_for_mega_moe_sm90(l1_weights, l2_weights):
+            return l1_weights, l2_weights
+
+    hidden_size = 128
+    intermediate_size = 128
+    experts = mega_moe.DeepGemmMegaMoESM90Experts.__new__(
+        mega_moe.DeepGemmMegaMoESM90Experts
+    )
+    torch.nn.Module.__init__(experts)
+    experts.hidden_size = hidden_size
+    experts.intermediate_size = intermediate_size
+    experts.block_size = 128
+    experts.num_shared_experts = 1
+    experts.num_local_experts = 1
+    experts._transformed_l1_weights = (
+        torch.empty(1, 2 * intermediate_size, hidden_size),
+        torch.empty(1, 2, 1),
+    )
+    experts._transformed_l2_weights = (
+        torch.empty(1, hidden_size, intermediate_size),
+        torch.empty(1, 1, 1),
+    )
+    experts._transformed_shared_l1_weights = None
+    experts._transformed_shared_l2_weights = None
+    experts._check_runtime_supported = lambda: None
+
+    shared_experts = torch.nn.Module()
+    shared_experts.gate_up_proj = torch.nn.Module()
+    shared_experts.gate_up_proj.weight = torch.nn.Parameter(
+        torch.empty(
+            2 * intermediate_size,
+            hidden_size,
+            dtype=torch.float8_e4m3fn,
+        ),
+        requires_grad=False,
+    )
+    shared_experts.gate_up_proj.weight_scale_inv = torch.nn.Parameter(
+        torch.empty(2, 1, dtype=torch.float32), requires_grad=False
+    )
+    shared_experts.down_proj = torch.nn.Module()
+    shared_experts.down_proj.weight = torch.nn.Parameter(
+        torch.empty(
+            hidden_size,
+            intermediate_size,
+            dtype=torch.float8_e4m3fn,
+        ),
+        requires_grad=False,
+    )
+    shared_experts.down_proj.weight_scale_inv = torch.nn.Parameter(
+        torch.empty(1, 1, dtype=torch.float32), requires_grad=False
+    )
+
+    monkeypatch.setattr("vllm.utils.deep_gemm._import_deep_gemm", lambda: FakeDeepGemm)
+    experts.finalize_weights(shared_experts)
+
+    assert experts.has_fused_shared_experts
+    assert experts._transformed_shared_l1_weights is not None
+    assert experts._transformed_shared_l2_weights is not None
 
 
 def test_glm52_mega_moe_expert_mapping_uses_checkpoint_prefix(monkeypatch):
