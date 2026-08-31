@@ -31,6 +31,7 @@ from .model import (
     Glm5NextMoE,
     _try_load_fp8_attn_proj,
     _try_load_fp8_indexer_wk,
+    _use_sm90_mega_moe,
     get_spec_layer_idx_from_weight_name,
 )
 from .ops.fused_eh_norm import fused_eh_norm
@@ -212,6 +213,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
+        self.use_sm90_mega_moe = _use_sm90_mega_moe(vllm_config)
         self.model = Glm5NextMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -303,6 +305,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts,
+            routed_experts_prefix=("" if self.use_sm90_mega_moe else "routed_experts"),
         )
 
         params_dict = dict(self.named_parameters())
@@ -426,4 +429,6 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     f"MTP speculative decoding layer {layer_idx} weights "
                     f"missing from checkpoint."
                 )
+        for mlp in self.moe_mlp_layers:
+            mlp.finalize_mega_moe_weights()
         return loaded_params

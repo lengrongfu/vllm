@@ -116,6 +116,21 @@ def is_deep_gemm_supported() -> bool:
 
 
 @functools.cache
+def deep_gemm_supports_sm90_mega_moe() -> bool:
+    if not is_deep_gemm_supported():
+        return False
+    deep_gemm = _import_deep_gemm()
+    return deep_gemm is not None and all(
+        hasattr(deep_gemm, name)
+        for name in (
+            "fp8_mega_moe_sm90",
+            "get_symm_buffer_for_sm90_mega_moe",
+            "transform_weights_for_mega_moe_sm90",
+        )
+    )
+
+
+@functools.cache
 def is_deep_gemm_e8m0_used() -> bool:
     """Return `True` if vLLM is configured to use DeepGEMM "
     "E8M0 scale on a Hopper or Blackwell-class GPU.
@@ -780,6 +795,7 @@ def should_use_deepgemm_for_fp8_linear(
 
 __all__ = [
     "calc_diff",
+    "deep_gemm_supports_sm90_mega_moe",
     "DeepGemmQuantScaleFMT",
     "fp8_gemm_nt",
     "fp8_einsum",
