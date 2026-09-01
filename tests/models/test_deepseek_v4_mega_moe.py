@@ -220,7 +220,7 @@ def test_deepseek_v4_mega_moe_finalizes_native_shared_expert_weights(monkeypatch
         intermediate_size=128,
         num_shared_experts=1,
     )
-    experts._check_runtime_supported = lambda: None
+    experts._check_runtime_supported = lambda: "sm100"
 
     def fp8_parameter(*shape):
         return torch.nn.Parameter(
@@ -259,6 +259,102 @@ def test_deepseek_v4_mega_moe_finalizes_native_shared_expert_weights(monkeypatch
         experts._transformed_shared_l2_weights[0].data_ptr()
         == shared_experts.down_proj.weight.data_ptr()
     )
+
+
+def test_deepseek_v4_mega_moe_finalizes_sm90_mxfp4_weights(monkeypatch):
+    class FakeDeepGemm:
+        routed_inputs = None
+        shared_scale_dtypes = None
+
+        @staticmethod
+        def get_symm_buffer_for_sm90_mega_moe(*args, num_shared_experts=0, **kwargs):
+            return None
+
+        @staticmethod
+        def fp8_mxfp4_mega_moe(
+            y,
+            l1_weights,
+            l2_weights,
+            sym_buffer,
+            shared_l1_weights=None,
+            shared_l2_weights=None,
+            **kwargs,
+        ):
+            return None
+
+        @classmethod
+        def transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
+            cls, l1_weights, l2_weights
+        ):
+            cls.routed_inputs = (l1_weights, l2_weights)
+            num_experts = l1_weights[0].shape[0]
+            return (
+                l1_weights[0].clone(),
+                l1_weights[1].clone(),
+                torch.ones(num_experts),
+            ), (
+                l2_weights[0].clone(),
+                l2_weights[1].clone(),
+                torch.ones(num_experts),
+            )
+
+        @classmethod
+        def transform_shared_weights_for_fp8_mega_moe_sm90(cls, l1_weights, l2_weights):
+            cls.shared_scale_dtypes = (l1_weights[1].dtype, l2_weights[1].dtype)
+            return (l1_weights[0].clone(), l1_weights[1]), l2_weights
+
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    experts = DeepseekV4MegaMoEExperts(
+        vllm_config,
+        num_experts=2,
+        num_local_experts=1,
+        experts_start_idx=0,
+        top_k=1,
+        hidden_size=512,
+        intermediate_size=256,
+        num_shared_experts=1,
+        supports_sm90_mxfp4=True,
+    )
+    experts._check_runtime_supported = lambda: "sm90"
+
+    def fp8_parameter(*shape):
+        return torch.nn.Parameter(
+            torch.empty(*shape, dtype=torch.float8_e4m3fn), requires_grad=False
+        )
+
+    def scale_parameter(*shape):
+        return torch.nn.Parameter(
+            torch.ones(*shape, dtype=torch.float8_e8m0fnu), requires_grad=False
+        )
+
+    shared_experts = SimpleNamespace(
+        gate_up_proj=SimpleNamespace(
+            weight=fp8_parameter(512, 512),
+            weight_block_size=(128, 128),
+            weight_scale_inv=scale_parameter(4, 4),
+        ),
+        down_proj=SimpleNamespace(
+            weight=fp8_parameter(512, 256),
+            weight_block_size=(128, 128),
+            weight_scale_inv=scale_parameter(4, 2),
+        ),
+    )
+    monkeypatch.setattr("vllm.utils.deep_gemm._import_deep_gemm", lambda: FakeDeepGemm)
+
+    experts.finalize_weights(shared_experts)
+
+    assert FakeDeepGemm.routed_inputs is not None
+    routed_l1, routed_l2 = FakeDeepGemm.routed_inputs
+    assert routed_l1[0].dtype == torch.int8
+    assert routed_l1[1].dtype == torch.uint8
+    assert routed_l2[0].dtype == torch.int8
+    assert routed_l2[1].dtype == torch.uint8
+    assert FakeDeepGemm.shared_scale_dtypes == (torch.float32, torch.float32)
+    assert experts.has_fused_shared_experts
+    assert len(experts.get_expert_weights()) == 6
 
 
 @pytest.mark.parametrize("fused", [False, True])
@@ -387,6 +483,83 @@ def test_deepseek_v4_mega_moe_fused_input_staging_is_bitwise_exact():
     assert torch.equal(
         fused_topk_weights.view(torch.uint8),
         ref_topk_weights.view(torch.uint8),
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="DeepSeek V4 SM90 MegaMoE input staging requires CUDA.",
+)
+def test_deepseek_v4_sm90_mega_moe_input_staging_is_bitwise_exact():
+    from vllm.third_party.deep_gemm.utils import per_token_cast_to_fp8
+
+    device = torch.device("cuda")
+    num_tokens = 7
+    hidden_size = 512
+    top_k = 6
+    generator = torch.Generator(device=device)
+    generator.manual_seed(411)
+    hidden_states = torch.randn(
+        num_tokens,
+        hidden_size,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    topk_ids = torch.randint(
+        0,
+        256,
+        (num_tokens, top_k),
+        device=device,
+        dtype=torch.int32,
+        generator=generator,
+    )
+    topk_weights = torch.randn(
+        num_tokens,
+        top_k,
+        device=device,
+        dtype=torch.float32,
+        generator=generator,
+    )
+
+    ref_x, ref_x_sf = per_token_cast_to_fp8(
+        hidden_states,
+        use_ue8m0=False,
+        gran_k=128,
+        use_packed_ue8m0=False,
+    )
+    fused_x = torch.empty_like(ref_x)
+    fused_x_sf = torch.empty_like(ref_x_sf)
+    fused_shared_storage = torch.empty(
+        hidden_size // 128,
+        num_tokens,
+        dtype=torch.float32,
+        device=device,
+    )
+    fused_shared_x_sf = fused_shared_storage.t()
+    fused_topk_idx = torch.empty_like(topk_ids, dtype=torch.int64)
+    fused_topk_weights = torch.empty_like(topk_weights)
+
+    prepare_megamoe_inputs(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        fused_x,
+        fused_x_sf,
+        fused_topk_idx,
+        fused_topk_weights,
+        shared_x_sf=fused_shared_x_sf,
+        use_sm90=True,
+    )
+    torch.accelerator.synchronize()
+
+    assert torch.equal(fused_x.view(torch.uint8), ref_x.view(torch.uint8))
+    assert torch.equal(fused_x_sf, ref_x_sf)
+    assert torch.equal(fused_shared_x_sf, ref_x_sf)
+    assert torch.equal(fused_topk_idx, topk_ids.to(torch.int64))
+    assert torch.equal(
+        fused_topk_weights.view(torch.uint8),
+        topk_weights.view(torch.uint8),
     )
 
 

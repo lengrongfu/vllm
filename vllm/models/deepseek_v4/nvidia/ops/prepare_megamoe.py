@@ -46,6 +46,7 @@ def _prepare_megamoe_inputs_kernel(
     GROUP_K: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
     SHARED_BLOCK_M: tl.constexpr,
+    USE_SM90: tl.constexpr,
 ) -> None:
     token_id = tl.program_id(0)
     k_block_id = tl.program_id(1)
@@ -64,15 +65,18 @@ def _prepare_megamoe_inputs_kernel(
     amax = tl.maximum(amax, 1.0e-4)
 
     scale = amax / 448.0
-    scale_bits = scale.to(tl.uint32, bitcast=True)
-    scale_exp = ((scale_bits >> 23) & 0xFF) + ((scale_bits & 0x7FFFFF) != 0).to(
-        tl.uint32
-    )
-    scale_exp = tl.minimum(tl.maximum(scale_exp, 1), 254)
-    rounded_scale = (scale_exp << 23).to(tl.float32, bitcast=True)
+    if USE_SM90:
+        quant_scale = scale
+    else:
+        scale_bits = scale.to(tl.uint32, bitcast=True)
+        scale_exp = ((scale_bits >> 23) & 0xFF) + ((scale_bits & 0x7FFFFF) != 0).to(
+            tl.uint32
+        )
+        scale_exp = tl.minimum(tl.maximum(scale_exp, 1), 254)
+        quant_scale = (scale_exp << 23).to(tl.float32, bitcast=True)
 
     hidden_groups = tl.reshape(hidden, [num_groups, GROUP_K])
-    scaled = hidden_groups * (1.0 / rounded_scale)[:, None]
+    scaled = hidden_groups * (1.0 / quant_scale)[:, None]
     scaled = tl.reshape(scaled, [BLOCK_K])
     fp8 = scaled.to(tl.float8e4nv)
     tl.store(
@@ -81,30 +85,35 @@ def _prepare_megamoe_inputs_kernel(
         mask=k_mask,
     )
 
-    scale_offsets = tl.arange(0, num_groups)
-    packed_scale = tl.sum(scale_exp << (scale_offsets * 8), axis=0).to(tl.int32)
-    tl.store(
-        x_sf + token_id * x_sf_stride_m + k_block_id * x_sf_stride_k,
-        packed_scale,
-    )
+    if USE_SM90:
+        output_scale = tl.sum(quant_scale, axis=0)
+    else:
+        scale_offsets = tl.arange(0, num_groups)
+        output_scale = tl.sum(scale_exp << (scale_offsets * 8), axis=0).to(tl.int32)
+    tl.store(x_sf + token_id * x_sf_stride_m + k_block_id * x_sf_stride_k, output_scale)
 
     # DeepGEMM's SM100 shared-expert TMA loads require the activation scales
     # in an MN-major layout whose row permutation depends on the MegaMoE
     # scheduler's runtime BLOCK_M. Write that view while the packed UE8M0 scale
     # is already resident, avoiding another kernel and temporary tensor.
     if shared_x_sf is not None:
-        m_block_id = token_id // SHARED_BLOCK_M
-        m_in_block = token_id % SHARED_BLOCK_M
-        aligned_block_m: tl.constexpr = triton.cdiv(SHARED_BLOCK_M, 128) * 128
-        transposed_m = (
-            (m_in_block // 128) * 128 + (m_in_block % 32) * 4 + (m_in_block % 128) // 32
-        )
-        shared_row = m_block_id * aligned_block_m + transposed_m
+        if USE_SM90:
+            shared_row = token_id
+        else:
+            m_block_id = token_id // SHARED_BLOCK_M
+            m_in_block = token_id % SHARED_BLOCK_M
+            aligned_block_m: tl.constexpr = triton.cdiv(SHARED_BLOCK_M, 128) * 128
+            transposed_m = (
+                (m_in_block // 128) * 128
+                + (m_in_block % 32) * 4
+                + (m_in_block % 128) // 32
+            )
+            shared_row = m_block_id * aligned_block_m + transposed_m
         tl.store(
             shared_x_sf
             + shared_row * shared_x_sf_stride_m
             + k_block_id * shared_x_sf_stride_k,
-            packed_scale,
+            output_scale,
         )
 
     if k_block_id == 0:
@@ -156,6 +165,7 @@ def prepare_megamoe_inputs(
     is_padding: torch.Tensor | None = None,
     shared_x_sf: torch.Tensor | None = None,
     shared_block_m: int | None = None,
+    use_sm90: bool = False,
 ) -> None:
     num_tokens, hidden_size = hidden_states.shape
     if num_tokens == 0:
@@ -171,23 +181,30 @@ def prepare_megamoe_inputs(
             "DeepSeek V4 MegaMoE input staging requires topk_weights and "
             "topk_ids to have the same shape."
         )
-    if (shared_x_sf is None) != (shared_block_m is None):
+    if use_sm90 and shared_block_m is not None:
         raise ValueError(
-            "DeepSeek V4 MegaMoE shared input staging requires both "
-            "shared_x_sf and shared_block_m."
+            "SM90 MegaMoE shared input staging does not use shared_block_m."
+        )
+    if not use_sm90 and (shared_x_sf is None) != (shared_block_m is None):
+        raise ValueError(
+            "SM100 MegaMoE shared input staging requires both shared_x_sf "
+            "and shared_block_m."
         )
     if shared_x_sf is not None:
-        assert shared_block_m is not None
-        if shared_block_m <= 0:
-            raise ValueError("MegaMoE shared_block_m must be positive.")
         expected_sf_k = hidden_size // 128
         if shared_x_sf.ndim != 2 or shared_x_sf.shape[1] != expected_sf_k:
             raise ValueError(
                 "MegaMoE shared_x_sf must have shape "
                 f"(*, {expected_sf_k}), got {tuple(shared_x_sf.shape)}."
             )
-        aligned_block_m = triton.cdiv(shared_block_m, 128) * 128
-        required_rows = triton.cdiv(num_tokens, shared_block_m) * aligned_block_m
+        if use_sm90:
+            required_rows = num_tokens
+        else:
+            assert shared_block_m is not None
+            if shared_block_m <= 0:
+                raise ValueError("MegaMoE shared_block_m must be positive.")
+            aligned_block_m = triton.cdiv(shared_block_m, 128) * 128
+            required_rows = triton.cdiv(num_tokens, shared_block_m) * aligned_block_m
         if shared_x_sf.shape[0] < required_rows:
             raise ValueError(
                 "MegaMoE shared_x_sf has insufficient rows: requires "
@@ -228,8 +245,9 @@ def prepare_megamoe_inputs(
         hidden_size,
         top_k,
         BLOCK_K=block_k,
-        GROUP_K=32,
+        GROUP_K=128 if use_sm90 else 32,
         BLOCK_TOPK=block_topk,
         SHARED_BLOCK_M=shared_block_m or 1,
+        USE_SM90=use_sm90,
         num_warps=4,
     )
