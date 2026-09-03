@@ -101,16 +101,28 @@ def test_fi_backend_strings_are_registered_mega_moe_backends():
 
 
 @pytest.mark.parametrize("moe_backend", sorted(FLASHINFER_MOE_EP_BACKENDS))
-def test_fi_moe_ep_backend_rejected_for_non_dsv4(moe_backend):
+def test_fi_moe_ep_backend_rejected_for_unsupported_model(moe_backend):
     """An FI moe_ep backend with a non-DSv4 model must fail at config time
     instead of silently falling through to the generic FusedMoE path."""
-    with pytest.raises(ValueError, match="only supported for DeepSeek-V4"):
+    with pytest.raises(ValueError, match="only supported for models with"):
         validate_flashinfer_moe_ep_model(moe_backend, ["MixtralForCausalLM"])
 
 
 @pytest.mark.parametrize("moe_backend", sorted(FLASHINFER_MOE_EP_BACKENDS))
 def test_fi_moe_ep_backend_accepted_for_dsv4(moe_backend):
     validate_flashinfer_moe_ep_model(moe_backend, ["DeepseekV4ForCausalLM"])
+
+
+@pytest.mark.parametrize("moe_backend", sorted(FLASHINFER_MOE_EP_BACKENDS))
+def test_fi_moe_ep_backend_accepted_for_glm_moe_dsa(moe_backend):
+    validate_flashinfer_moe_ep_model(moe_backend, ["GlmMoeDsaForCausalLM"])
+
+
+def test_modelopt_nvfp4_checkpoint_is_detected():
+    from vllm.models.deepseek_v4.nvidia.fi_moe import ckpt_uses_nvfp4_experts
+
+    config = SimpleNamespace(quant_config=SimpleNamespace(quant_method="NVFP4"))
+    assert ckpt_uses_nvfp4_experts(config)
 
 
 @pytest.mark.parametrize(

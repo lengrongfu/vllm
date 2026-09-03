@@ -33,11 +33,14 @@ def ckpt_uses_nvfp4_experts(vllm_config: VllmConfig) -> bool:
     (e2m1 + fp8-e4m3 per-16 block scales + per-tensor weight_scale_2), i.e.
     the recipe the nvfp4_cutedsl prequantized-weights path consumes verbatim.
 
-    DeepSeek-V4 NVFP4-expert checkpoints declare ``moe_quant_algo: NVFP4`` in
-    their ``quantization_config``, which DeepseekV4FP8Config surfaces as
-    ``moe_quant_algo``.
+    DeepSeek-V4 checkpoints surface this as ``moe_quant_algo``; ModelOpt
+    checkpoints such as GLM MoE DSA surface it as ``quant_method``.
     """
-    return getattr(vllm_config.quant_config, "moe_quant_algo", "") == "NVFP4"
+    quant_config = vllm_config.quant_config
+    return (
+        getattr(quant_config, "moe_quant_algo", "") == "NVFP4"
+        or getattr(quant_config, "quant_method", "") == "NVFP4"
+    )
 
 
 def resolve_mega_moe_is_padding(num_tokens: int) -> torch.Tensor | None:

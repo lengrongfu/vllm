@@ -82,6 +82,38 @@ def _mock_sequence_parallel_collectives(monkeypatch, module):
     )
 
 
+def test_flashinfer_moe_ep_forces_sequence_parallel_at_tp8():
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            use_sequence_parallel_moe=False,
+            enable_expert_parallel=True,
+            tensor_parallel_size=8,
+        ),
+        kernel_config=SimpleNamespace(moe_backend="flashinfer_moe_ep_mega_cutedsl"),
+    )
+
+    assert deepseek_v32_model._use_sequence_parallel(vllm_config)
+
+
+def test_flashinfer_moe_ep_keeps_excluded_mtp_layer_on_existing_backend():
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            use_sequence_parallel_moe=False,
+            enable_expert_parallel=True,
+            tensor_parallel_size=8,
+        ),
+        kernel_config=SimpleNamespace(moe_backend="flashinfer_moe_ep_mega_cutedsl"),
+        quant_config=SimpleNamespace(
+            is_layer_excluded=lambda prefix: prefix.startswith("model.layers.78.")
+        ),
+    )
+
+    assert not deepseek_v32_model._use_flashinfer_moe_ep(vllm_config, "model.layers.78")
+    assert not deepseek_v32_model._use_sequence_parallel(vllm_config, "model.layers.78")
+
+
 def test_decoder_layer_keeps_dense_states_sequence_sharded(monkeypatch):
     layer = object.__new__(deepseek_v32_model.DeepseekV32DecoderLayer)
     nn.Module.__init__(layer)

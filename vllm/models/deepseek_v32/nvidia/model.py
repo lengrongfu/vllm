@@ -46,8 +46,34 @@ from vllm.models.common.ops.sequence_parallel import (
 )
 from vllm.models.deepseek_v32.attention import DeepseekV32Attention
 from vllm.sequence import IntermediateTensors
+from vllm.utils.flashinfer_moe_ep import is_fi_moe_ep_backend
 
 from .glm52_low_latency_gemm import enable_glm52_low_latency_gemm
+
+
+def _use_flashinfer_moe_ep(vllm_config: VllmConfig, prefix: str = "") -> bool:
+    if not is_fi_moe_ep_backend(vllm_config.kernel_config.moe_backend):
+        return False
+    is_layer_excluded = getattr(
+        getattr(vllm_config, "quant_config", None), "is_layer_excluded", None
+    )
+    return not (
+        prefix
+        and is_layer_excluded is not None
+        and is_layer_excluded(f"{prefix}.mlp.experts")
+    )
+
+
+def _use_sequence_parallel(vllm_config: VllmConfig, prefix: str = "") -> bool:
+    parallel_config = vllm_config.parallel_config
+    return parallel_config.pipeline_parallel_size == 1 and (
+        parallel_config.use_sequence_parallel_moe
+        or (
+            _use_flashinfer_moe_ep(vllm_config, prefix)
+            and parallel_config.enable_expert_parallel
+            and parallel_config.tensor_parallel_size > 1
+        )
+    )
 
 
 class DeepseekV32DecoderLayer(torch.nn.Module):
@@ -70,10 +96,8 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
         layer_idx = int(prefix.split(sep=".")[-1])
         self.layer_idx = layer_idx
         self.use_mha = False
-        self.use_sequence_parallel = (
-            parallel_config.use_sequence_parallel_moe
-            and parallel_config.pipeline_parallel_size == 1
-        )
+        self.use_sequence_parallel = _use_sequence_parallel(vllm_config, prefix)
+        use_flashinfer_moe_ep = _use_flashinfer_moe_ep(vllm_config, prefix)
 
         self.self_attn = DeepseekV32Attention(
             vllm_config=vllm_config,
@@ -89,14 +113,23 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
         ):
             # Keep the MoE output un-reduced. Non-SP fuses its all-reduce into
             # the next layer norm; SP keeps the token shard local.
-            self.mlp = DeepseekV2MoE(
-                config=config,
-                parallel_config=parallel_config,
-                quant_config=quant_config,
-                reduce_results=False,
-                prefix=f"{prefix}.mlp",
-                apply_routed_scale_to_output=False,
-            )
+            if use_flashinfer_moe_ep:
+                from .fi_moe import GlmMoeDsaFlashInferMoE
+
+                self.mlp = GlmMoeDsaFlashInferMoE(
+                    vllm_config,
+                    prefix=f"{prefix}.mlp",
+                    use_sequence_parallel=self.use_sequence_parallel,
+                )
+            else:
+                self.mlp = DeepseekV2MoE(
+                    config=config,
+                    parallel_config=parallel_config,
+                    quant_config=quant_config,
+                    reduce_results=False,
+                    prefix=f"{prefix}.mlp",
+                    apply_routed_scale_to_output=False,
+                )
         else:
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
@@ -153,7 +186,10 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
                 hidden_states, residual, self.post_attention_layernorm
             )
 
-        if self.use_sequence_parallel and isinstance(self.mlp, DeepseekV2MoE):
+        if self.use_sequence_parallel and (
+            isinstance(self.mlp, DeepseekV2MoE)
+            or getattr(self.mlp, "_is_flashinfer_moe_ep", False)
+        ):
             hidden_states = self.mlp(hidden_states, already_sequence_parallel=True)
         else:
             hidden_states = self.mlp(hidden_states)
@@ -175,10 +211,8 @@ class DeepseekV32Model(torch.nn.Module):
 
         self.vocab_size = config.vocab_size
         parallel_config = vllm_config.parallel_config
-        self.use_sequence_parallel = (
-            parallel_config.use_sequence_parallel_moe
-            and parallel_config.pipeline_parallel_size == 1
-        )
+        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
+        self.use_flashinfer_moe_ep = _use_flashinfer_moe_ep(vllm_config)
         # DSA is always sparse (has index_topk); allocate the shared top-k
         # buffer the indexer writes and the sparse MLA backend reads.
         self.is_v32 = True
@@ -329,6 +363,9 @@ class DeepseekV32Model(torch.nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts,
             num_redundant_experts=self.num_redundant_experts,
+            routed_experts_prefix=""
+            if self.use_flashinfer_moe_ep
+            else "routed_experts",
         )
 
         pp_missing_layer_names = get_pp_missing_layer_names(self)
@@ -409,6 +446,10 @@ class DeepseekV32Model(torch.nn.Module):
                     loader = getattr(param, "weight_loader", default_weight_loader)
                     loader(param, loaded_weight)
             loaded_params.add(name)
+        if self.use_flashinfer_moe_ep:
+            for layer in self.layers:
+                if getattr(getattr(layer, "mlp", None), "_is_flashinfer_moe_ep", False):
+                    layer.mlp.finalize_weights()
         return loaded_params
 
 
@@ -435,7 +476,9 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
-            if isinstance(layer.mlp, DeepseekV2MoE):
+            if isinstance(layer.mlp, DeepseekV2MoE) or getattr(
+                layer.mlp, "_is_flashinfer_moe_ep", False
+            ):
                 example_moe = layer.mlp
                 self.moe_mlp_layers.append(layer.mlp)
                 self.moe_layers.append(layer.mlp.experts)

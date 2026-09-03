@@ -165,6 +165,7 @@ FLASHINFER_MOE_EP_ARCHITECTURES = frozenset(
     {
         "DeepseekV4ForCausalLM",
         "DeepSeekV4MTPModel",
+        "GlmMoeDsaForCausalLM",
     }
 )
 
@@ -177,8 +178,9 @@ def validate_flashinfer_moe_ep_model(
         return
     if not any(arch in FLASHINFER_MOE_EP_ARCHITECTURES for arch in architectures):
         raise ValueError(
-            f"moe_backend={moe_backend!r} is only supported for DeepSeek-V4 "
-            f"models ({sorted(FLASHINFER_MOE_EP_ARCHITECTURES)}), but the "
+            f"moe_backend={moe_backend!r} is only supported for models with "
+            f"a FlashInfer moe_ep path "
+            f"({sorted(FLASHINFER_MOE_EP_ARCHITECTURES)}), but the "
             f"model is {list(architectures)}."
         )
 
@@ -256,7 +258,7 @@ class KernelConfig:
     - "flashinfer_moe_ep_mega_cutedsl": Same, with the CuteDSL megakernel
       (additionally requires NVSHMEM). The checkpoint selects the weight path:
       an NVFP4 checkpoint is consumed prequantized, MXFP4 weights are
-      requantized at load
+      requantized at load. Also supported by GLM MoE DSA NVFP4 models
     - "marlin": Use Marlin kernels (weight-only quantization)
     - "humming": Use Humming Mixed Precision kernels
     - "triton_unfused": Use Triton unfused MoE kernels
