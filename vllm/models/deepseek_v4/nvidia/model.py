@@ -175,7 +175,9 @@ def make_deepseek_v4_expert_params_mapping(
 
 
 class DeepseekV4MegaMoEExperts(nn.Module):
-    _symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int, int], object] = {}
+    _symm_buffer_cache: dict[
+        tuple[int, int, int, int, int, int, int, int, str], object
+    ] = {}
 
     def __init__(
         self,
@@ -203,6 +205,22 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.intermediate_size = intermediate_size
         self.num_shared_experts = num_shared_experts
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self._native_deep_gemm = (
+            vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        )
+        self._sm90_nvfp4 = (
+            self._native_deep_gemm
+            and current_platform.is_device_capability(90)
+            and current_platform.is_cuda()
+        )
+        # ModelOpt's public DeepSeek-V4 NVFP4 checkpoint excludes MTP weights
+        # from NVFP4 quantization (see ``mtp.*`` in hf_quant_config.json).
+        # MTP experts therefore retain the MXFP4 UE8M0 scales, which have a
+        # different K granularity from the main model's NVFP4 scales.
+        self._checkpoint_nvfp4 = (
+            getattr(vllm_config.quant_config, "moe_quant_algo", "") == "NVFP4"
+            and ".mtp_block." not in prefix
+        )
 
         self.num_logical_experts = (
             num_logical_experts if num_logical_experts is not None else num_experts
@@ -222,12 +240,16 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         )
         set_weight_attrs(self.w13_weight, weight_attrs)
 
+        w13_scale_dtype = torch.float8_e4m3fn if self._checkpoint_nvfp4 else torch.uint8
+        w2_scale_dtype = w13_scale_dtype
+        w13_scale_k = hidden_size // (16 if self._checkpoint_nvfp4 else 32)
+        w2_scale_k = intermediate_size // (16 if self._checkpoint_nvfp4 else 32)
         self.w13_weight_scale = nn.Parameter(
             torch.zeros(
                 num_local_experts,
                 2 * intermediate_size,
-                hidden_size // 32,
-                dtype=torch.uint8,
+                w13_scale_k,
+                dtype=w13_scale_dtype,
             ),
             requires_grad=False,
         )
@@ -249,13 +271,35 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             torch.zeros(
                 num_local_experts,
                 hidden_size,
-                intermediate_size // 32,
-                dtype=torch.uint8,
+                w2_scale_k,
+                dtype=w2_scale_dtype,
             ),
             requires_grad=False,
         )
         set_weight_attrs(self.w2_weight_scale, weight_attrs)
         self.w2_weight_scale.quant_method = "block"
+
+        if self._checkpoint_nvfp4:
+            self.w13_weight_scale_2 = nn.Parameter(
+                torch.zeros(num_local_experts, 2, dtype=torch.float32),
+                requires_grad=False,
+            )
+            self.w2_weight_scale_2 = nn.Parameter(
+                torch.zeros(num_local_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+            self.w13_input_scale = nn.Parameter(
+                torch.zeros(num_local_experts, 2, dtype=torch.float32),
+                requires_grad=False,
+            )
+            self.w2_input_scale = nn.Parameter(
+                torch.zeros(num_local_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+            set_weight_attrs(self.w13_weight_scale_2, weight_attrs)
+            set_weight_attrs(self.w2_weight_scale_2, weight_attrs)
+            set_weight_attrs(self.w13_input_scale, weight_attrs)
+            set_weight_attrs(self.w2_input_scale, weight_attrs)
 
         self._transformed_l1_weights: tuple[torch.Tensor, torch.Tensor] | None = None
         self._transformed_l2_weights: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -265,6 +309,8 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self._transformed_shared_l2_weights: (
             tuple[torch.Tensor, torch.Tensor] | None
         ) = None
+        self._sm90_l1_global_scales: torch.Tensor | None = None
+        self._sm90_l2_global_scales: torch.Tensor | None = None
 
         # Register in the static forward context so the custom-op wrapper
         # can look up this module by name from within a torch.compile graph.
@@ -292,6 +338,33 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         expert_id: int,
         return_success: bool = False,
     ) -> bool | None:
+        if self._checkpoint_nvfp4 and (
+            "weight_scale_2" in weight_name or "input_scale" in weight_name
+        ):
+            local_expert_ids = self._map_global_expert_id(expert_id)
+            if not local_expert_ids:
+                return False if return_success else None
+            value = loaded_weight.reshape(()).to(torch.float32)
+            scale_params = (
+                self.w13_weight_scale_2
+                if "w13_" in weight_name and "weight_scale_2" in weight_name
+                else self.w2_weight_scale_2
+                if "w2_" in weight_name and "weight_scale_2" in weight_name
+                else self.w13_input_scale
+                if "w13_" in weight_name
+                else self.w2_input_scale
+            )
+            for local_expert_id in local_expert_ids:
+                if shard_id in ("w1", "w3") and "w13_" in weight_name:
+                    scale_params.data[local_expert_id, 0 if shard_id == "w1" else 1] = (
+                        value
+                    )
+                elif shard_id == "w2" and "w2_" in weight_name:
+                    scale_params.data[local_expert_id] = value
+                else:
+                    raise ValueError(f"Unsupported expert shard id: {shard_id}")
+            return True if return_success else None
+
         local_expert_ids = self._map_global_expert_id(expert_id)
         if not local_expert_ids:
             return False if return_success else None
@@ -331,7 +404,30 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
     def _check_runtime_supported(self) -> None:
         device = self.w13_weight.device
-        if torch.cuda.get_device_capability(device)[0] != 10:
+        major, minor = torch.cuda.get_device_capability(device)
+        if self._native_deep_gemm and self._checkpoint_nvfp4 and not self._sm90_nvfp4:
+            raise NotImplementedError(
+                "DeepGEMM MegaMoE NVFP4 experts are currently supported on SM90 only."
+            )
+        if self._sm90_nvfp4:
+            if (major, minor) != (9, 0):
+                raise NotImplementedError(
+                    "DeepGEMM SM90 NVFP4 MegaMoE requires an SM90 GPU."
+                )
+            if (
+                self.hidden_size % 512 != 0
+                or self.intermediate_size % 512 != 0
+                or self.top_k < 1
+                or self.top_k > 32
+                or self.num_experts < self.top_k
+                or self.num_experts > 512
+            ):
+                raise NotImplementedError(
+                    "DeepGEMM SM90 NVFP4 MegaMoE requires hidden and "
+                    "intermediate sizes divisible by 512, top_k in [1, 32], "
+                    "and at least top_k experts (up to 512 total)."
+                )
+        elif major != 10:
             raise NotImplementedError("DeepGEMM MegaMoE requires SM100 GPUs.")
         if self.hidden_size % 128 != 0 or self.intermediate_size % 128 != 0:
             raise ValueError(
@@ -502,6 +598,127 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
         deep_gemm = _import_deep_gemm()
 
+        if self._sm90_nvfp4:
+            if self._transformed_l1_weights is not None:
+                return
+            self._check_runtime_supported()
+            if not hasattr(deep_gemm, "nvfp4_mega_moe"):
+                raise RuntimeError(
+                    "The installed DeepGEMM does not provide the SM90 "
+                    "NVFP4 MegaMoE API. Install the DeepGEMM build that "
+                    "exports nvfp4_mega_moe."
+                )
+            try:
+                buffer_api = signature(
+                    deep_gemm.get_symm_buffer_for_mega_moe
+                ).parameters
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "The installed DeepGEMM does not expose a compatible "
+                    "SM90 NVFP4 MegaMoE buffer API."
+                ) from exc
+            if "mma_type" not in buffer_api or not hasattr(
+                deep_gemm, "transform_nvfp4_weights_for_mega_moe_sm90"
+            ):
+                raise RuntimeError(
+                    "The installed DeepGEMM is missing the SM90 NVFP4 "
+                    "MegaMoE APIs. Install the DeepGEMM build that exports "
+                    "mma_type, transform_nvfp4_weights_for_mega_moe_sm90, "
+                    "and nvfp4_mega_moe."
+                )
+            if self._checkpoint_nvfp4:
+                l1_packed = self.w13_weight.data
+                l1_scale_fp8 = self.w13_weight_scale.data
+                l1_global_scales = self.w13_weight_scale_2.data.float()
+                gate_scales = l1_global_scales[:, 0]
+                up_scales = l1_global_scales[:, 1]
+                l2_global_scales = self.w2_weight_scale_2.data.float()
+                if (
+                    not torch.isfinite(l1_global_scales).all()
+                    or (l1_global_scales <= 0).any()
+                    or not torch.isfinite(l2_global_scales).all()
+                    or (l2_global_scales <= 0).any()
+                ):
+                    raise ValueError(
+                        "NVFP4 MegaMoE requires finite, positive weight scales."
+                    )
+                if not torch.equal(gate_scales, up_scales):
+                    ratio = up_scales / gate_scales
+                    up_scale_values = l1_scale_fp8[:, self.intermediate_size :].float()
+                    folded = up_scale_values * ratio[:, None, None]
+                    folded_fp8 = folded.to(torch.float8_e4m3fn)
+                    if not torch.equal(folded_fp8.float(), folded):
+                        raise ValueError(
+                            "NVFP4 MegaMoE cannot fold different gate/up L1 "
+                            "global scales into the FP8 block scales exactly."
+                        )
+                    l1_scale_fp8 = l1_scale_fp8.clone()
+                    l1_scale_fp8[:, self.intermediate_size :] = folded_fp8
+                self._sm90_l1_global_scales = gate_scales.contiguous()
+                l1_scale = l1_scale_fp8.view(torch.uint8)
+                l2_packed = self.w2_weight.data
+                l2_scale = self.w2_weight_scale.data.view(torch.uint8)
+                self._sm90_l2_global_scales = l2_global_scales.contiguous()
+            else:
+                # The public DeepSeek-V4 Flash checkpoint stores MXFP4
+                # (E2M1 with UE8M0 scales per 32 values). Convert one expert
+                # at a time to the NVFP4 scale granularity expected by SM90.
+                from deep_gemm.quantization_nvfp4 import quantize_to_nvfp4
+
+                def convert_mxfp4(weight: torch.Tensor, scale: torch.Tensor):
+                    experts, rows, packed_k = weight.shape
+                    packed_chunks, scale_chunks = [], []
+                    magnitudes = torch.tensor(
+                        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+                        dtype=torch.float32,
+                        device=weight.device,
+                    )
+                    for expert in range(experts):
+                        packed = weight[expert]
+                        values = (
+                            torch.stack((packed & 0xF, packed >> 4), dim=-1)
+                            .flatten(-2)
+                            .to(torch.long)
+                        )
+                        sign = torch.where((values & 8) != 0, -1.0, 1.0)
+                        decoded = magnitudes[values & 7] * sign
+                        decoded = decoded.view(rows, -1, 32)
+                        scales = (scale[expert].to(torch.int32) << 23).view(
+                            torch.float32
+                        )
+                        decoded = (decoded * scales.unsqueeze(-1)).view(rows, -1)
+                        packed_nvfp4, scale_nvfp4 = quantize_to_nvfp4(
+                            decoded.unsqueeze(0), group_size=16
+                        )
+                        packed_chunks.append(packed_nvfp4)
+                        scale_chunks.append(scale_nvfp4)
+                    return torch.cat(packed_chunks), torch.cat(scale_chunks)
+
+                l1_packed, l1_scale = convert_mxfp4(
+                    self.w13_weight.data, self.w13_weight_scale.data
+                )
+                l2_packed, l2_scale = convert_mxfp4(
+                    self.w2_weight.data, self.w2_weight_scale.data
+                )
+                self._sm90_l1_global_scales = None
+                self._sm90_l2_global_scales = None
+
+            self._transformed_l1_weights, self._transformed_l2_weights = (
+                deep_gemm.transform_nvfp4_weights_for_mega_moe_sm90(
+                    (l1_packed, l1_scale), (l2_packed, l2_scale)
+                )
+            )
+            self.w13_weight = None
+            self.w13_weight_scale = None
+            self.w2_weight = None
+            self.w2_weight_scale = None
+            if self._checkpoint_nvfp4:
+                self.w13_weight_scale_2 = None
+                self.w2_weight_scale_2 = None
+                self.w13_input_scale = None
+                self.w2_input_scale = None
+            return
+
         if self._transformed_l1_weights is None:
             self._check_runtime_supported()
             w13_scale = deep_gemm.transform_sf_into_required_layout(
@@ -570,6 +787,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             self.hidden_size,
             self.intermediate_size,
             self.num_shared_experts if self.has_fused_shared_experts else 0,
+            "fp4xfp4" if self._sm90_nvfp4 else "fp8xfp4",
         )
         symm_buffer = self._symm_buffer_cache.get(key)
         if symm_buffer is None:
@@ -583,6 +801,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 num_shared_experts=(
                     self.num_shared_experts if self.has_fused_shared_experts else 0
                 ),
+                mma_type="fp4xfp4" if self._sm90_nvfp4 else "fp8xfp4",
             )
             self._symm_buffer_cache[key] = symm_buffer
         return symm_buffer
@@ -667,6 +886,32 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
         if self.capture_fn is not None:
             self.capture_fn(topk_ids)
+
+        if self._sm90_nvfp4:
+            from vllm.utils.deep_gemm import per_block_cast_to_fp8
+
+            x_fp8, x_scale = per_block_cast_to_fp8(
+                hidden_states, block_size=[1, 128], use_ue8m0=False
+            )
+            symm_buffer.x[:num_tokens].copy_(x_fp8)
+            symm_buffer.x_sf[:num_tokens].copy_(x_scale)
+            if is_padding is not None:
+                topk_ids = torch.where(is_padding.unsqueeze(1), -1, topk_ids)
+            symm_buffer.topk_idx[:num_tokens].copy_(topk_ids.to(torch.int32))
+            symm_buffer.topk_weights[:num_tokens].copy_(topk_weights.float())
+            assert self._transformed_l1_weights is not None
+            assert self._transformed_l2_weights is not None
+            deep_gemm.nvfp4_mega_moe(
+                y,
+                self._transformed_l1_weights,
+                self._transformed_l2_weights,
+                symm_buffer,
+                l1_global_scales=self._sm90_l1_global_scales,
+                l2_global_scales=self._sm90_l2_global_scales,
+                activation_clamp=activation_clamp,
+                fast_math=fast_math,
+            )
+            return y
 
         # EPLB: map logical expert IDs to physical replicas and record load.
         eplb_state = self.eplb_state
@@ -878,6 +1123,7 @@ class DeepseekV4MoE(nn.Module):
         fuse_shared_experts = bool(
             self.shared_experts is not None
             and not envs.VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION
+            and not current_platform.is_device_capability(90)
             and (self.use_sequence_parallel or self.tp_size == 1)
             and not self.use_fi_mega_moe
         )
@@ -1373,7 +1619,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        if self.use_mega_moe:
+        if self.use_mega_moe and input_ids is not None:
             input_ids = input_ids.to(torch.int64)
 
         full_num_tokens = positions.shape[0]
