@@ -8,6 +8,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.config.kernel import MoEBackend
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_embed_norm import (
@@ -48,6 +49,57 @@ from vllm.models.deepseek_v32.attention import DeepseekV32Attention
 from vllm.sequence import IntermediateTensors
 
 from .glm52_low_latency_gemm import enable_glm52_low_latency_gemm
+from .mega_moe import DeepseekV32MegaMoE
+
+
+def _use_deep_gemm_mega_moe(vllm_config: VllmConfig) -> bool:
+    return vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+
+
+def _use_nvfp4_mega_moe(vllm_config: VllmConfig, prefix: str) -> bool:
+    quant_config = vllm_config.quant_config
+    modelopt_config = typing.cast(typing.Any, quant_config)
+    return bool(
+        _use_deep_gemm_mega_moe(vllm_config)
+        and quant_config is not None
+        and quant_config.get_name() == "modelopt_fp4"
+        and getattr(quant_config, "quant_method", None) == "NVFP4"
+        and not modelopt_config.is_layer_excluded(f"{prefix}.mlp.experts")
+    )
+
+
+def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
+    parallel_config = vllm_config.parallel_config
+    return parallel_config.pipeline_parallel_size == 1 and (
+        parallel_config.use_sequence_parallel_moe
+        or (
+            _use_deep_gemm_mega_moe(vllm_config)
+            and parallel_config.enable_expert_parallel
+            and parallel_config.tensor_parallel_size > 1
+        )
+    )
+
+
+def _make_expert_params_mapping(
+    model: torch.nn.Module,
+    *,
+    num_experts: int,
+    num_redundant_experts: int = 0,
+) -> list[tuple[str, str, int, str]]:
+    mapping_kwargs = dict(
+        model=model,
+        ckpt_gate_proj_name="gate_proj",
+        ckpt_down_proj_name="down_proj",
+        ckpt_up_proj_name="up_proj",
+        num_experts=num_experts,
+        num_redundant_experts=num_redundant_experts,
+    )
+    model_owned = fused_moe_make_expert_params_mapping(
+        **mapping_kwargs,
+        routed_experts_prefix="",
+    )
+    routed_experts = fused_moe_make_expert_params_mapping(**mapping_kwargs)
+    return model_owned + routed_experts
 
 
 class DeepseekV32DecoderLayer(torch.nn.Module):
@@ -70,9 +122,15 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
         layer_idx = int(prefix.split(sep=".")[-1])
         self.layer_idx = layer_idx
         self.use_mha = False
-        self.use_sequence_parallel = (
+        is_target_layer = layer_idx < config.num_hidden_layers
+        self.use_sequence_parallel = parallel_config.pipeline_parallel_size == 1 and (
             parallel_config.use_sequence_parallel_moe
-            and parallel_config.pipeline_parallel_size == 1
+            or (
+                is_target_layer
+                and _use_deep_gemm_mega_moe(vllm_config)
+                and parallel_config.enable_expert_parallel
+                and parallel_config.tensor_parallel_size > 1
+            )
         )
 
         self.self_attn = DeepseekV32Attention(
@@ -89,14 +147,26 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
         ):
             # Keep the MoE output un-reduced. Non-SP fuses its all-reduce into
             # the next layer norm; SP keeps the token shard local.
-            self.mlp = DeepseekV2MoE(
-                config=config,
-                parallel_config=parallel_config,
-                quant_config=quant_config,
-                reduce_results=False,
-                prefix=f"{prefix}.mlp",
-                apply_routed_scale_to_output=False,
-            )
+            if _use_nvfp4_mega_moe(vllm_config, prefix):
+                self.mlp = DeepseekV32MegaMoE(
+                    vllm_config,
+                    config=config,
+                    prefix=f"{prefix}.mlp",
+                    use_sequence_parallel=self.use_sequence_parallel,
+                )
+            else:
+                moe_backend: MoEBackend | None = (
+                    "triton" if _use_deep_gemm_mega_moe(vllm_config) else None
+                )
+                self.mlp = DeepseekV2MoE(
+                    config=config,
+                    parallel_config=parallel_config,
+                    quant_config=quant_config,
+                    reduce_results=False,
+                    prefix=f"{prefix}.mlp",
+                    apply_routed_scale_to_output=False,
+                    moe_backend=moe_backend,
+                )
         else:
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
@@ -152,8 +222,9 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
             hidden_states, residual = fused_allreduce_rms_norm(
                 hidden_states, residual, self.post_attention_layernorm
             )
-
-        if self.use_sequence_parallel and isinstance(self.mlp, DeepseekV2MoE):
+        if self.use_sequence_parallel and isinstance(
+            self.mlp, (DeepseekV2MoE, DeepseekV32MegaMoE)
+        ):
             hidden_states = self.mlp(hidden_states, already_sequence_parallel=True)
         else:
             hidden_states = self.mlp(hidden_states)
@@ -175,10 +246,7 @@ class DeepseekV32Model(torch.nn.Module):
 
         self.vocab_size = config.vocab_size
         parallel_config = vllm_config.parallel_config
-        self.use_sequence_parallel = (
-            parallel_config.use_sequence_parallel_moe
-            and parallel_config.pipeline_parallel_size == 1
-        )
+        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
         # DSA is always sparse (has index_topk); allocate the shared top-k
         # buffer the indexer writes and the sparse MLA backend reads.
         self.is_v32 = True
@@ -322,11 +390,8 @@ class DeepseekV32Model(torch.nn.Module):
             ("wk_weights_proj", "wk", 0),
             ("wk_weights_proj", "weights_proj", 1),
         ]
-        expert_params_mapping = fused_moe_make_expert_params_mapping(
+        expert_params_mapping = _make_expert_params_mapping(
             self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts,
             num_redundant_experts=self.num_redundant_experts,
         )
@@ -379,6 +444,8 @@ class DeepseekV32Model(torch.nn.Module):
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
                     if is_pp_missing_parameter(name_mapped, self):
+                        continue
+                    if name_mapped not in params_dict:
                         continue
                     param = params_dict[name_mapped]
                     weight_loader = typing.cast(
@@ -435,8 +502,15 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
-            if isinstance(layer.mlp, DeepseekV2MoE):
+            if isinstance(layer.mlp, (DeepseekV2MoE, DeepseekV32MegaMoE)):
                 example_moe = layer.mlp
                 self.moe_mlp_layers.append(layer.mlp)
                 self.moe_layers.append(layer.mlp.experts)
         self.extract_moe_parameters(example_moe)
+
+    def process_weights_after_loading(self) -> None:
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+            if isinstance(layer.mlp, DeepseekV32MegaMoE):
+                layer.mlp.finalize_mega_moe_weights()

@@ -14,9 +14,6 @@ from vllm.model_executor.layers.fused_embed_norm import (
     has_full_vocab_on_rank,
     make_input_embedding,
 )
-from vllm.model_executor.layers.fused_moe import (
-    fused_moe_make_expert_params_mapping,
-)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.model_loader.mtp_validation import (
@@ -52,7 +49,8 @@ from .glm52_low_latency_gemm import (
     enable_glm52_low_latency_gemm,
     run_glm52_plan,
 )
-from .model import DeepseekV32DecoderLayer
+from .mega_moe import DeepseekV32MegaMoE
+from .model import DeepseekV32DecoderLayer, _make_expert_params_mapping
 
 
 class DeepseekV32MultiTokenPredictorLayer(nn.Module):
@@ -280,11 +278,17 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
         example_moe = None
         for layer in self.model.layers.values():
             mlp = layer.mtp_block.mlp
-            if isinstance(mlp, DeepseekV2MoE):
+            if isinstance(mlp, (DeepseekV2MoE, DeepseekV32MegaMoE)):
                 example_moe = mlp
                 self.moe_mlp_layers.append(mlp)
                 self.moe_layers.append(mlp.experts)
         self.extract_moe_parameters(example_moe)
+
+    def process_weights_after_loading(self) -> None:
+        for layer in self.model.layers.values():
+            mlp = layer.mtp_block.mlp
+            if isinstance(mlp, DeepseekV32MegaMoE):
+                mlp.finalize_mega_moe_weights()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -351,11 +355,8 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
             ("wk_weights_proj", "wk", 0),
             ("wk_weights_proj", "weights_proj", 1),
         ]
-        expert_params_mapping = fused_moe_make_expert_params_mapping(
+        expert_params_mapping = _make_expert_params_mapping(
             self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts,
         )
 
@@ -413,6 +414,8 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
                             continue
                         is_expert_weight = True
                         name_mapped = chunk_name.replace(weight_name, param_name)
+                        if name_mapped not in params_dict:
+                            continue
                         param = params_dict[name_mapped]
                         weight_loader = typing.cast(
                             Callable[..., bool], param.weight_loader
