@@ -37,6 +37,7 @@ import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig, get_current_vllm_config
+from vllm.config.kernel import MoEBackend
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -297,6 +298,7 @@ class DeepseekV2MoE(nn.Module):
         reduce_results: bool = True,
         prefix: str = "",
         apply_routed_scale_to_output: bool = False,
+        moe_backend: MoEBackend | None = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -397,6 +399,7 @@ class DeepseekV2MoE(nn.Module):
             else None,
             fuse_shared_experts=self.is_fused_shared_expert_enabled,
             router_logits_dtype=self.gate.out_dtype,
+            moe_backend=moe_backend,
         )
 
         if (
