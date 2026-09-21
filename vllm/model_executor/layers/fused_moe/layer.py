@@ -8,6 +8,7 @@ import torch
 
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import ParallelConfig, get_current_vllm_config
+from vllm.config.kernel import MoEBackend
 from vllm.distributed import (
     get_dp_group,
     get_pcp_group,
@@ -137,6 +138,8 @@ def FusedMoEFactory(
     runner_args: dict[str, Any] | None = None,
     routed_experts_cls: type[RoutedExperts] | None = None,
     routed_experts_args: dict[str, Any] | None = None,
+    skip_padding: bool = False,
+    moe_backend: MoEBackend | None = None,
 ) -> MoERunner:
     """Factory function for creating MoE execution pipeline.
 
@@ -208,6 +211,8 @@ def FusedMoEFactory(
         runner_args: Additional arguments for runner constructor
         routed_experts_cls: Custom RoutedExperts class (None = use default)
         routed_experts_args: Additional arguments for routed_experts constructor
+        skip_padding: Whether grouped routing should invalidate padding rows.
+        moe_backend: Per-layer backend override. None uses the global backend.
 
     Returns:
         MoERunner: Configured MoE execution pipeline ready for forward passes
@@ -345,7 +350,7 @@ def FusedMoEFactory(
         num_logical_experts=logical_num_experts,
         moe_parallel_config=moe_parallel_config,
         in_dtype=moe_in_dtype,
-        moe_backend=vllm_config.kernel_config.moe_backend,
+        moe_backend=moe_backend or vllm_config.kernel_config.moe_backend,
         router_logits_dtype=router_logits_dtype,
         max_num_tokens=max_num_batched_tokens,
         elastic_ep_max_dp_size=vllm_config.parallel_config.elastic_ep_max_dp_size,
