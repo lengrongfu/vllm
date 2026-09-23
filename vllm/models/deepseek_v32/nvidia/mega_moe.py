@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -14,8 +15,10 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
+    GroupedTopKRouter,
     grouped_topk,
 )
+from vllm.model_executor.layers.fused_moe.router.mega_gate_router import MegaGateRouter
 from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2MLP,
     _get_moe_router_dtype,
@@ -422,6 +425,33 @@ class DeepseekV32MegaMoE(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.renormalize = config.norm_topk_prob
         self.scoring_func = getattr(config, "scoring_func", "softmax")
+        self.mega_gate: MegaGateRouter | None = None
+        if (
+            bool(int(os.getenv("VLLM_GLM_USE_MEGA_GATE", "0")))
+            and config.model_type == "glm_moe_dsa"
+        ):
+            router = GroupedTopKRouter(
+                top_k=self.top_k,
+                global_num_experts=self.n_routed_experts,
+                num_expert_group=self.num_expert_group,
+                topk_group=self.topk_group,
+                renormalize=self.renormalize,
+                scoring_func=self.scoring_func,
+                routed_scaling_factor=self.routed_scaling_factor,
+                e_score_correction_bias=self.gate.e_score_correction_bias,
+            )
+            if MegaGateRouter.is_supported(router, self.gate):
+                mega_gate = MegaGateRouter(router, self.gate)
+                if mega_gate.available:
+                    self.mega_gate = mega_gate
+                    logger.info_once(
+                        "Enabled DeepGEMM Mega-Gate for GLM NVFP4 MegaMoE."
+                    )
+                else:
+                    logger.warning_once(
+                        "GLM Mega-Gate requested but unavailable in this DeepGEMM "
+                        "build for the current GPU; using the original router."
+                    )
         self.experts = DeepseekV32MegaMoEExperts(
             vllm_config,
             num_experts=self.n_physical_experts,
@@ -458,18 +488,23 @@ class DeepseekV32MegaMoE(nn.Module):
             raise RuntimeError("MegaMoE expects model-level sequence-parallel input.")
         org_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, org_shape[-1])
-        router_logits, _ = self.gate(hidden_states)
-        topk_weights, topk_ids = grouped_topk(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=self.top_k,
-            renormalize=self.renormalize,
-            num_expert_group=self.num_expert_group,
-            topk_group=self.topk_group,
-            scoring_func=self.scoring_func,
-            routed_scaling_factor=self.routed_scaling_factor,
-            e_score_correction_bias=self.gate.e_score_correction_bias,
-        )
+        if self.mega_gate is not None:
+            topk_weights, topk_ids = self.mega_gate.select_experts(
+                hidden_states, hidden_states, torch.int64
+            )
+        else:
+            router_logits, _ = self.gate(hidden_states)
+            topk_weights, topk_ids = grouped_topk(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=self.top_k,
+                renormalize=self.renormalize,
+                num_expert_group=self.num_expert_group,
+                topk_group=self.topk_group,
+                scoring_func=self.scoring_func,
+                routed_scaling_factor=self.routed_scaling_factor,
+                e_score_correction_bias=self.gate.e_score_correction_bias,
+            )
         output = self.experts(hidden_states, topk_weights, topk_ids)
         if self.shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)

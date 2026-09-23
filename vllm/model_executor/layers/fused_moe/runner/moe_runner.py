@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, cast
@@ -35,6 +36,11 @@ from vllm.model_executor.layers.fused_moe.routed_experts import (
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
+from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
+    GroupedTopKRouter,
+)
+from vllm.model_executor.layers.fused_moe.router.mega_gate_router import MegaGateRouter
 from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
     ZeroExpertRouter,
 )
@@ -279,6 +285,38 @@ class MoERunner(MoERunnerInterface):
         self._fse_fuse_gate = gate is not None and shared_expert_gate is not None
         self._combined_gate_weight: torch.Tensor | None = None
 
+        vllm_config = get_current_vllm_config()
+        if (
+            bool(int(os.getenv("VLLM_GLM_USE_MEGA_GATE", "0")))
+            and vllm_config.model_config is not None
+            and vllm_config.model_config.hf_text_config.model_type == "glm_moe_dsa"
+        ):
+            if (
+                not self._quant_method.is_monolithic
+                and not self.do_naive_dispatch_combine
+                and moe_config.pcp_size == 1
+                and not self._fse_fuse_gate
+                and routed_input_transform is None
+                and vllm_config.lora_config is None
+                and MegaGateRouter.is_supported(router, gate)
+            ):
+                self.router = MegaGateRouter(
+                    cast(GroupedTopKRouter, router), cast(GateLinear, gate)
+                )
+                if self.router.available:
+                    logger.info_once("GLM Mega-Gate enabled for modular MoE (M > 16).")
+                else:
+                    logger.warning_once(
+                        "GLM Mega-Gate unavailable; using the original gate/router. "
+                        "Requires SM90 or SM10x with DeepGEMM bf16_mega_gate."
+                    )
+            else:
+                logger.warning_once(
+                    "GLM Mega-Gate disabled for this MoE configuration. Use a "
+                    "modular backend, e.g. flashinfer_cutlass, with BF16 gate, "
+                    "single-group sigmoid routing, no LoRA or PCP."
+                )
+
         self._shared_experts: SharedExperts | None = None
         if shared_experts is not None:
             can_overlap = lambda: self._quant_method.mk_can_overlap_shared_experts
@@ -328,14 +366,24 @@ class MoERunner(MoERunnerInterface):
 
     # TODO(bnell): Temporary hack. Get rid of this.
     def _replace_quant_method(self, quant_method: FusedMoEMethodBase):
+        self._disable_mega_gate()
         self.routed_experts._replace_quant_method(quant_method)
 
     # TODO(bnell): Hack for elastic_ep. Get rid of this
     def _set_moe_config(self, new_moe_config: FusedMoEConfig):
+        self._disable_mega_gate()
         self.moe_config = new_moe_config
         self.routed_experts._set_moe_config(new_moe_config)
         if self._shared_experts is not None:
             self._shared_experts._set_moe_config(new_moe_config)
+
+    def _disable_mega_gate(self) -> None:
+        if isinstance(self.router, MegaGateRouter):
+            fallback = self.router.fallback
+            fallback.eplb_state = self.router.eplb_state
+            fallback.set_capture_fn(self.router.capture_fn)
+            fallback._routing_replay_out = self.router._routing_replay_out
+            self.router = fallback
 
     def _maybe_fuse_gate_weights(self):
         """Fuse router and shared expert gate weights on first call.
@@ -895,7 +943,7 @@ class MoERunner(MoERunnerInterface):
         # If the Runner holds the gate, apply it after the stream sync,
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
-        if self.gate is not None:
+        if self.gate is not None and not isinstance(self.router, MegaGateRouter):
             if self._fse_fuse_gate:
                 self._maybe_fuse_gate_weights()
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)

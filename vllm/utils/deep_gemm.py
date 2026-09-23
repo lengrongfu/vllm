@@ -486,6 +486,30 @@ def cublaslt_gemm_nt(*args, **kwargs):
     return _cublaslt_gemm_nt_impl(*args, **kwargs)
 
 
+def is_mega_gate_supported() -> bool:
+    if not (
+        current_platform.is_device_capability(90)
+        or current_platform.is_device_capability_family(100)
+    ):
+        return False
+    if not is_deep_gemm_supported():
+        return False
+    _lazy_init()
+    if _bf16_mega_gate_impl is None:
+        return False
+    # Older builds export Mega-Gate for SM10x only. Query launch metadata
+    # without compiling or launching a kernel to check the active architecture.
+    config_fn = getattr(_import_deep_gemm(), "get_bf16_mega_gate_config", None)
+    if config_fn is None:
+        return current_platform.is_device_capability_family(100)
+    try:
+        # Probe a GLM shape, including when a valid split-K override is set.
+        config_fn(32, 6144, 256, 8)
+    except (RuntimeError, AssertionError):
+        return False
+    return True
+
+
 def bf16_mega_gate(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -494,6 +518,7 @@ def bf16_mega_gate(
     scoring_func: str,
     routed_scaling_factor: float,
     ep_rank: int,
+    mask: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
     image_bias: torch.Tensor | None = None,
     image_token_mask: torch.Tensor | None = None,
@@ -524,6 +549,7 @@ def bf16_mega_gate(
         num_shared_experts=0,
         routed_scaling_factor=routed_scaling_factor,
         ep_rank=ep_rank,
+        mask=mask,
         scoring_func=scoring_func,
         bias=bias,
         image_bias=image_bias,
@@ -1042,6 +1068,7 @@ def should_use_deepgemm_for_fp8_linear(
 __all__ = [
     "calc_diff",
     "bf16_mega_gate",
+    "is_mega_gate_supported",
     "DeepGemmQuantScaleFMT",
     "fp8_gemm_nt",
     "fp8_einsum",
