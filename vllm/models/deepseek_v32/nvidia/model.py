@@ -60,16 +60,27 @@ def _use_deep_gemm_mega_moe(vllm_config: VllmConfig) -> bool:
     return vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
 
 
-def _use_nvfp4_mega_moe(vllm_config: VllmConfig, prefix: str) -> bool:
+def _nvfp4_mega_moe_disabled_reason(vllm_config: VllmConfig, prefix: str) -> str | None:
+    if not _use_deep_gemm_mega_moe(vllm_config):
+        return "moe_backend is not 'deep_gemm_mega_moe'"
     quant_config = vllm_config.quant_config
+    if quant_config is None:
+        return "quant_config is not set"
+    quant_name = quant_config.get_name()
+    if quant_name != "modelopt_fp4":
+        return f"quantization method is {quant_name!r}, not 'modelopt_fp4'"
+    quant_method = getattr(quant_config, "quant_method", None)
+    if quant_method != "NVFP4":
+        return f"ModelOpt quant_method is {quant_method!r}, not 'NVFP4'"
     modelopt_config = typing.cast(typing.Any, quant_config)
-    return bool(
-        _use_deep_gemm_mega_moe(vllm_config)
-        and quant_config is not None
-        and quant_config.get_name() == "modelopt_fp4"
-        and getattr(quant_config, "quant_method", None) == "NVFP4"
-        and not modelopt_config.is_layer_excluded(f"{prefix}.mlp.experts")
-    )
+    experts_prefix = f"{prefix}.mlp.experts"
+    if modelopt_config.is_layer_excluded(experts_prefix):
+        return f"{experts_prefix!r} is excluded from ModelOpt quantization"
+    return None
+
+
+def _use_nvfp4_mega_moe(vllm_config: VllmConfig, prefix: str) -> bool:
+    return bool(_nvfp4_mega_moe_disabled_reason(vllm_config, prefix) is None)
 
 
 def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
@@ -153,7 +164,10 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
         ):
             # Keep the MoE output un-reduced. Non-SP fuses its all-reduce into
             # the next layer norm; SP keeps the token shard local.
-            if _use_nvfp4_mega_moe(vllm_config, prefix):
+            mega_moe_disabled_reason = _nvfp4_mega_moe_disabled_reason(
+                vllm_config, prefix
+            )
+            if mega_moe_disabled_reason is None:
                 self.mlp = DeepseekV32MegaMoE(
                     vllm_config,
                     config=config,
@@ -161,6 +175,14 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
                     use_sequence_parallel=self.use_sequence_parallel,
                 )
             else:
+                if _use_deep_gemm_mega_moe(vllm_config) and "is excluded" not in (
+                    mega_moe_disabled_reason
+                ):
+                    raise ValueError(
+                        "moe_backend='deep_gemm_mega_moe' was requested, but "
+                        f"{prefix}.mlp cannot use DeepseekV32MegaMoE: "
+                        f"{mega_moe_disabled_reason}."
+                    )
                 moe_backend: MoEBackend | None = (
                     "triton" if _use_deep_gemm_mega_moe(vllm_config) else None
                 )

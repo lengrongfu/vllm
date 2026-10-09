@@ -149,6 +149,7 @@ def glm_mega_gate(monkeypatch):
         "monolithic",
         "pcp",
         "naive_dispatch",
+        "deferred_internal_dispatch",
         "other_model",
     ],
 )
@@ -185,12 +186,18 @@ def test_mega_gate_runner_routes_once_and_preserves_capture(
 
     quant_method = SimpleNamespace(
         is_monolithic=mode == "monolithic",
-        supports_internal_mk=mode != "naive_dispatch",
+        supports_internal_mk=mode
+        not in ("naive_dispatch", "deferred_internal_dispatch"),
         topk_indices_dtype=torch.int32,
     )
     experts = torch.nn.Module()
     experts.quant_method = quant_method
-    experts._ensure_moe_quant_config_init = lambda: None
+
+    def initialize_kernel():
+        if mode == "deferred_internal_dispatch":
+            quant_method.supports_internal_mk = True
+
+    experts._ensure_moe_quant_config_init = initialize_kernel
     received = {}
 
     def forward_modular(**kwargs):
@@ -216,7 +223,9 @@ def test_mega_gate_runner_routes_once_and_preserves_capture(
     runner = moe_runner.MoERunner(
         "model.layers.3.mlp.experts",
         SimpleNamespace(
-            dp_size=2 if mode == "naive_dispatch" else 1,
+            dp_size=4
+            if mode in ("naive_dispatch", "deferred_internal_dispatch")
+            else 1,
             pcp_size=2 if mode == "pcp" else 1,
             is_sequence_parallel=False,
         ),
@@ -233,10 +242,11 @@ def test_mega_gate_runner_routes_once_and_preserves_capture(
     runner.router._routing_replay_out = replay
     mapping = Mock(side_effect=lambda logical_ids: logical_ids + 256)
     monkeypatch.setattr(runner.router, "_apply_eplb_mapping", mapping)
+    monkeypatch.setattr(fallback, "_apply_eplb_mapping", mapping)
 
     output = runner._forward_impl(x, x, None)
     torch.testing.assert_close(output, x * expected_weights.sum(1, keepdim=True))
-    uses_fused = mode in ("fused", "sm90_cold_capture")
+    uses_fused = mode in ("fused", "sm90_cold_capture", "deferred_internal_dispatch")
     assert gate.forward.call_count == (not uses_fused)
     assert fused.call_count == uses_fused
     if mode == "monolithic":

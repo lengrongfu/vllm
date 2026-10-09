@@ -87,6 +87,56 @@ def test_expert_mapping_supports_model_owned_and_routed_experts():
     ) in mapping
 
 
+def test_deep_gemm_mega_moe_rejects_non_w4a4_nvfp4(monkeypatch):
+    class QuantConfig:
+        quant_method = "W4A16_NVFP4"
+
+        @staticmethod
+        def get_name():
+            return "modelopt_fp4"
+
+        @staticmethod
+        def is_layer_excluded(prefix):
+            return False
+
+    config = SimpleNamespace(
+        hidden_size=6144,
+        intermediate_size=2048,
+        hidden_act="silu",
+        rms_norm_eps=1e-5,
+        num_hidden_layers=78,
+        n_routed_experts=256,
+        n_shared_experts=1,
+        num_experts_per_tok=8,
+        moe_intermediate_size=2048,
+        first_k_dense_replace=3,
+        moe_layer_freq=1,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=config, dtype=torch.bfloat16),
+        quant_config=QuantConfig(),
+        parallel_config=_parallel_config(
+            enable_eplb=False,
+            eplb_config=SimpleNamespace(num_redundant_experts=0),
+        ),
+        kernel_config=SimpleNamespace(moe_backend="deep_gemm_mega_moe"),
+    )
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v32.nvidia.model.DeepseekV32Attention",
+        lambda **kwargs: nn.Identity(),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="cannot use DeepseekV32MegaMoE.*W4A16_NVFP4.*not 'NVFP4'",
+    ):
+        DeepseekV32DecoderLayer(
+            vllm_config,
+            "model.layers.3",
+            config=config,
+        )
+
+
 def test_unquantized_mtp_overrides_mega_moe_backend(monkeypatch):
     class QuantConfig:
         quant_method = "NVFP4"

@@ -292,20 +292,23 @@ class MoERunner(MoERunnerInterface):
             and vllm_config.model_config is not None
             and vllm_config.model_config.hf_text_config.model_type == "glm_moe_dsa"
         ):
-            if (
-                not self._quant_method.is_monolithic
-                and not self.do_naive_dispatch_combine
-                and moe_config.pcp_size == 1
-                and not self._fse_fuse_gate
-                and routed_input_transform is None
-                and vllm_config.lora_config is None
-                and MegaGateRouter.is_supported(router, gate)
-            ):
+            requirements = {
+                "modular_backend": not self._quant_method.is_monolithic,
+                "pcp_size=1": moe_config.pcp_size == 1,
+                "no_shared_expert_gate": not self._fse_fuse_gate,
+                "no_input_transform": routed_input_transform is None,
+                "no_lora": vllm_config.lora_config is None,
+                "supported_router_and_gate": MegaGateRouter.is_supported(router, gate),
+            }
+            if all(requirements.values()):
                 self.router = MegaGateRouter(
                     cast(GroupedTopKRouter, router), cast(GateLinear, gate)
                 )
                 if self.router.available:
-                    logger.info_once("GLM Mega-Gate enabled for modular MoE (M > 16).")
+                    logger.info_once(
+                        "GLM Mega-Gate configured for modular MoE; dispatch "
+                        "compatibility will be checked after kernel initialization."
+                    )
                 else:
                     logger.warning_once(
                         "GLM Mega-Gate unavailable; using the original gate/router. "
@@ -313,9 +316,23 @@ class MoERunner(MoERunnerInterface):
                     )
             else:
                 logger.warning_once(
-                    "GLM Mega-Gate disabled for this MoE configuration. Use a "
-                    "modular backend, e.g. flashinfer_cutlass, with BF16 gate, "
-                    "single-group sigmoid routing, no LoRA or PCP."
+                    "GLM Mega-Gate disabled; using the original gate/router. "
+                    "Unmet requirements: %s. quant_method=%s, router=%s, gate=%s, "
+                    "gate_dtype=%s, gate_out_dtype=%s, groups=%s/%s, "
+                    "scoring=%s, renormalize=%s, fused_shared_experts=%s, "
+                    "gate_has_bias=%s.",
+                    ", ".join(name for name, met in requirements.items() if not met),
+                    type(self._quant_method).__name__,
+                    type(router).__name__,
+                    type(gate).__name__,
+                    getattr(getattr(gate, "weight", None), "dtype", None),
+                    getattr(gate, "out_dtype", None),
+                    getattr(router, "num_expert_group", None),
+                    getattr(router, "topk_group", None),
+                    getattr(router, "scoring_func", None),
+                    getattr(router, "renormalize", None),
+                    getattr(router, "num_fused_shared_experts", None),
+                    getattr(gate, "bias", None) is not None,
                 )
 
         self._shared_experts: SharedExperts | None = None
@@ -933,6 +950,20 @@ class MoERunner(MoERunnerInterface):
         """
         # TODO(bnell): this can be removed after MK migration is complete.
         self.routed_experts._ensure_moe_quant_config_init()
+
+        # Internal dispatch support is only known after the MoE kernel is built.
+        if isinstance(self.router, MegaGateRouter) and (
+            self._quant_method.is_monolithic or self.do_naive_dispatch_combine
+        ):
+            logger.warning_once(
+                "GLM Mega-Gate disabled after kernel initialization: "
+                "monolithic=%s, external_logits_dispatch=%s, quant_method=%s. "
+                "Using the original gate/router.",
+                self._quant_method.is_monolithic,
+                self.do_naive_dispatch_combine,
+                type(self._quant_method).__name__,
+            )
+            self._disable_mega_gate()
 
         # If using multi-stream overlap for shared experts, we must launch it
         # before routed expert dispatch.
