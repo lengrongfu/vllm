@@ -1768,6 +1768,15 @@ class RowParallelLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
         self.update_param_tp_status()
+        self._mkernel = None
+        if envs.VLLM_MKERNEL_CONFIG is not None:
+            from vllm.distributed.device_communicators.mkernel import (
+                get_mkernel_runtime,
+            )
+
+            self._mkernel = get_mkernel_runtime(
+                envs.VLLM_MKERNEL_CONFIG, get_current_vllm_config()
+            )
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         input_dim = getattr(param, "input_dim", None)
@@ -1812,12 +1821,17 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self, input_parallel, bias_)
-
-        if self.reduce_results and self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output_parallel)
-        else:
-            output = output_parallel
+        output = (
+            self._mkernel.try_apply(self, input_parallel)
+            if self._mkernel is not None
+            else None
+        )
+        if output is None:
+            output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+            if self.reduce_results and self.tp_size > 1:
+                output = tensor_model_parallel_all_reduce(output_parallel)
+            else:
+                output = output_parallel
 
         if not self.return_bias:
             return output

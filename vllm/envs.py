@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     VLLM_USE_FASTOKENS: bool = False
     VLLM_RINGBUFFER_WARNING_INTERVAL: int = 60
     VLLM_NCCL_SO_PATH: str | None = None
+    VLLM_MKERNEL_CONFIG: str | None = None
     LD_LIBRARY_PATH: str | None = None
     VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE: int = 256
     LOCAL_RANK: int = 0
@@ -756,6 +757,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Path to the NCCL library file. It is needed because nccl>=2.19 brought
     # by PyTorch contains a bug: https://github.com/NVIDIA/nccl/issues/1234
     "VLLM_NCCL_SO_PATH": lambda: os.environ.get("VLLM_NCCL_SO_PATH", None),
+    # Experimental eager-only mKernel GEMM+all-reduce correctness prototype.
+    # JSON configuration; absent by default. See features/mkernel.md.
+    # Set identically on every worker; requires dedicated 2x8 Hopper nodes.
+    "VLLM_MKERNEL_CONFIG": lambda: os.environ.get("VLLM_MKERNEL_CONFIG"),
     # when `VLLM_NCCL_SO_PATH` is not set, vllm will try to find the nccl
     # library file in the locations specified by `LD_LIBRARY_PATH`
     "LD_LIBRARY_PATH": lambda: os.environ.get("LD_LIBRARY_PATH", None),

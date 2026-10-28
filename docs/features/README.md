@@ -1,5 +1,8 @@
 # Features
 
+- [Experimental mKernel GEMM + AllReduce adapter](mkernel.md): an opt-in,
+  correctness-only two-node Hopper integration prototype.
+
 ## Compatibility Matrix
 
 The tables below show mutually exclusive features and the support on some hardware.

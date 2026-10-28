@@ -1,0 +1,71 @@
+diff --git a/include/operators/gemm_ar/session.cuh b/include/operators/gemm_ar/session.cuh
+index fef44ae..41ee3ed 100644
+--- a/include/operators/gemm_ar/session.cuh
++++ b/include/operators/gemm_ar/session.cuh
+@@ -84,6 +84,53 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
+ }
+ void destroy_session_py() { internode::py::destroy_session(g_session); }
+ void set_epoch_py(int epoch) { internode::py::set_epoch(g_session, epoch); }
++
++// Introspection for out-of-tree integrations. Keep layout calculations in the
++// same translation unit as the kernel rather than duplicating them in Python.
++pybind11::dict get_build_config_py() {
++    using G = gemm_ar_multinode::fused_globals;
++    pybind11::dict result;
++    result["abi_version"] = 1;
++    result["intra_num_devices"] = G::NUM_DEVICES;
++    result["row_block"] = G::ROW_BLOCK;
++    result["col_block"] = G::COL_BLOCK;
++    result["k_block"] = G::RED_BLOCK;
++    result["num_blocks"] = gemm_ar_multinode::config::NUM_BLOCKS;
++#if defined(INTERNODE_BACKEND_EFA)
++    result["backend"] = "efa";
++#else
++    result["backend"] = "cx7";
++#endif
++#if defined(KITTENS_HOPPER) && !defined(KITTENS_BLACKWELL)
++    result["cuda_arch"] = "hopper";
++#else
++    result["cuda_arch"] = "unsupported";
++#endif
++    result["dtype"] = "bfloat16";
++    return result;
++}
++
++int get_scratch_ints_py(int M, int N, int num_remote_queues,
++                       int num_allocated_remote_queues, int num_nodes) {
++    using G = gemm_ar_multinode::fused_globals;
++    // Bound the experimental adapter's contract before entering the existing
++    // int32 layout arithmetic. This is not a new general-purpose shape API.
++    TORCH_CHECK(M > 0 && M <= 65536 && N > 0 && N <= 65536,
++                "Integration scratch query supports 0 < M,N <= 65536");
++    TORCH_CHECK(M % (G::NUM_DEVICES * G::ROW_BLOCK) == 0,
++                "M must be divisible by local GPU count * row block");
++    TORCH_CHECK(N % G::COL_BLOCK == 0,
++                "N must be divisible by column block");
++    TORCH_CHECK(num_nodes == 2,
++                "Integration scratch query currently supports two nodes");
++    TORCH_CHECK(num_remote_queues > 0 && num_remote_queues <= 64 &&
++                num_allocated_remote_queues >= num_remote_queues &&
++                num_allocated_remote_queues <= 64,
++                "Integration queue counts must satisfy 1 <= used <= allocated <= 64");
++    return gemm_ar_multinode::gemm_ar_compute_scratch_layout(
++        M, N, num_remote_queues, num_allocated_remote_queues,
++        num_nodes).scratch_ints_needed;
++}
+ pybind11::list get_proxy_diagnostics_py() {
+     pybind11::list out;
+     for (const auto& diag : internode::get_proxy_diagnostics(g_session)) {
+@@ -172,6 +219,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+           pybind11::arg("peer_tcp_ports") = std::vector<int>{});
+     m.def("destroy_session", &destroy_session_py);
+     m.def("set_epoch", &set_epoch_py);
++    m.def("get_build_config", &get_build_config_py);
++    m.def("get_scratch_ints", &get_scratch_ints_py,
++          pybind11::arg("M"), pybind11::arg("N"),
++          pybind11::arg("num_remote_queues"),
++          pybind11::arg("num_allocated_remote_queues"),
++          pybind11::arg("num_nodes"));
+     m.def("get_proxy_diagnostics", &get_proxy_diagnostics_py);
+     m.def("get_proxy_timelines", &get_proxy_timelines_py);
+     m.def("get_globaltimer_calibration", &internode::py::get_globaltimer_calibration,

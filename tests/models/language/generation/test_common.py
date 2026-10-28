@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+
 import pytest
 import torch
 
@@ -14,6 +16,38 @@ from ...utils import check_logprobs_close
 EMBED_SCALING_MODELS = {
     "openbmb/MiniCPM4.1-8B",
 }
+
+
+@pytest.mark.core_model
+def test_mkernel_rejects_unsupported_topology_before_loading_native_library(
+    vllm_runner, monkeypatch, tmp_path
+):
+    """An explicit mKernel request must not silently run on one GPU."""
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv(
+        "VLLM_MKERNEL_CONFIG",
+        json.dumps(
+            {
+                "root": str(tmp_path / "missing-native-library"),
+                "prefix": "model.decoder.layers.0.fc2",
+                "shape": [1024, 4096, 896],
+                "node_ips": ["192.0.2.1", "192.0.2.2"],
+                "broker_key": "mkernel-invalid-topology-test",
+            }
+        ),
+    )
+    with (
+        pytest.raises(ValueError, match="mKernel requires identical configuration"),
+        vllm_runner(
+            "facebook/opt-125m",
+            enforce_eager=True,
+            tensor_parallel_size=1,
+            max_model_len=32,
+            trust_remote_code=False,
+        ),
+    ):
+        pytest.fail("Unsupported mKernel topology was accepted")
+
 
 # This list contains the model that are using AITER kernel.
 # Skip model that are not using AITER tests.
