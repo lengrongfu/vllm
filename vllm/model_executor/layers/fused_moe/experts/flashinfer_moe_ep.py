@@ -181,7 +181,11 @@ class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
         if self._adapter is None:
             raise RuntimeError("FlashInfer MoE-EP weights have not been processed")
         output.copy_(
-            self._adapter(hidden_states, topk_ids.to(torch.int32), topk_weights)
+            self._adapter(
+                hidden_states,
+                topk_ids.to(self._adapter.topk_indices_dtype),
+                topk_weights,
+            )
         )
 
 

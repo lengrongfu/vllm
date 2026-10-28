@@ -8,10 +8,12 @@ import pytest
 import torch
 
 from tests.kernels.moe.utils import make_dummy_moe_config
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.kernel import (
     FLASHINFER_MOE_EP_BACKENDS,
     FLASHINFER_MOE_EP_CUTEDSL,
     FLASHINFER_MOE_EP_DEEP_GEMM,
+    FLASHINFER_MOE_EP_MEGAFLUX_SM90,
     MEGA_MOE_BACKENDS,
     NATIVE_MEGA_MOE_BACKENDS,
     PASSTHROUGH_ALL2ALL_BACKEND,
@@ -63,6 +65,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
     kNvfp4Static,
 )
+from vllm.platforms.interface import DeviceCapability
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
@@ -71,18 +74,21 @@ def test_flashinfer_backends_are_megakernels_outside_the_native_model_path():
     assert FLASHINFER_MOE_EP_BACKENDS.isdisjoint(NATIVE_MEGA_MOE_BACKENDS)
 
 
-def test_only_deep_gemm_backend_is_dsv4_specific():
+@pytest.mark.parametrize(
+    "backend", [FLASHINFER_MOE_EP_DEEP_GEMM, FLASHINFER_MOE_EP_MEGAFLUX_SM90]
+)
+def test_model_specific_backends_require_dsv4(backend):
     validate_flashinfer_moe_ep_model(
         FLASHINFER_MOE_EP_CUTEDSL,
         ["MixtralForCausalLM"],
     )
     with pytest.raises(ValueError, match="only supported for DeepSeek-V4"):
         validate_flashinfer_moe_ep_model(
-            FLASHINFER_MOE_EP_DEEP_GEMM,
+            backend,
             ["MixtralForCausalLM"],
         )
     validate_flashinfer_moe_ep_model(
-        FLASHINFER_MOE_EP_DEEP_GEMM,
+        backend,
         ["DeepseekV4ForCausalLM"],
     )
 
@@ -133,6 +139,34 @@ def test_backend_specs_preserve_weight_format_contracts():
     assert deep_gemm.weight_formats == frozenset({"mxfp4"})
 
 
+@pytest.mark.parametrize("backend", sorted(FLASHINFER_MOE_EP_BACKENDS))
+@pytest.mark.parametrize(
+    "cc", [(8, 0), (9, 0), (9, 1), (10, 0), (10, 3), (12, 0), None]
+)
+def test_megaflux_does_not_expand_existing_backend_architectures(
+    monkeypatch, backend, cc
+):
+    """Hopper opt-in must not admit Blackwell kernels on an unsupported GPU."""
+    config = VllmConfig()
+    moe = replace(
+        make_dummy_moe_config(hidden_dim=256, intermediate_size=128),
+        moe_backend=backend,
+        routing_method=RoutingMethodType.DeepseekV4,
+    )
+    capability = None if cc is None else DeviceCapability(*cc)
+    monkeypatch.setattr(
+        fi_ep.current_platform, "get_device_capability", lambda: capability
+    )
+    with set_current_vllm_config(config):
+        reasons = fi_ep.flashinfer_moe_ep_unsupported_reasons(moe, kMxfp4Static, None)
+    supported = (
+        cc == (9, 0)
+        if backend == FLASHINFER_MOE_EP_MEGAFLUX_SM90
+        else cc in ((10, 0), (10, 3))
+    )
+    assert bool(reasons) is not supported, reasons
+
+
 def _megakernel_moe(moe_backend: str, **overrides) -> SimpleNamespace:
     fields = dict(
         moe_backend=moe_backend,
@@ -176,6 +210,9 @@ def megakernel_host(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         parallel_config=SimpleNamespace(enable_dbo=False, enable_eplb=False),
     )
     monkeypatch.setattr(fi_ep, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(
+        fi_ep.current_platform, "get_device_capability", lambda: DeviceCapability(10, 0)
+    )
     monkeypatch.setattr(
         FlashInferMoeEpExperts, "_supports_current_device", staticmethod(lambda: True)
     )

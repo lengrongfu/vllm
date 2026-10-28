@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -15,6 +16,7 @@ from vllm.config.kernel import (
     FLASHINFER_MOE_EP_BACKENDS,
     FLASHINFER_MOE_EP_CUTEDSL,
     FLASHINFER_MOE_EP_DEEP_GEMM,
+    FLASHINFER_MOE_EP_MEGAFLUX_SM90,
 )
 from vllm.distributed import get_ep_group
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
@@ -30,14 +32,14 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
-FlashInferMoeEpKernel = Literal["cutedsl", "deep_gemm"]
+FlashInferMoeEpKernel = Literal["cutedsl", "deep_gemm", "megaflux_sm90"]
 FlashInferMoeEpWeightFormat = Literal["nvfp4", "mxfp4"]
 _WEIGHT_FORMATS: dict[QuantKey | None, FlashInferMoeEpWeightFormat] = {
     kNvfp4Static: "nvfp4",
     kMxfp4Static: "mxfp4",
 }
 
-_SUPPORTED_CAPABILITIES = frozenset({(10, 0), (10, 3)})
+_SUPPORTED_CAPABILITIES = frozenset({(9, 0), (10, 0), (10, 3)})
 
 
 def supports_current_device() -> bool:
@@ -98,6 +100,10 @@ _BACKEND_SPECS = {
         kernel="deep_gemm",
         weight_formats=frozenset({"mxfp4"}),
     ),
+    FLASHINFER_MOE_EP_MEGAFLUX_SM90: FlashInferMoeEpBackendSpec(
+        kernel="megaflux_sm90",
+        weight_formats=frozenset({"mxfp4"}),
+    ),
 }
 
 assert frozenset(_BACKEND_SPECS) == FLASHINFER_MOE_EP_BACKENDS
@@ -131,6 +137,16 @@ def flashinfer_moe_ep_unsupported_reasons(
     """
     spec = flashinfer_moe_ep_backend_spec(moe.moe_backend)
     unsupported: list[str] = []
+    capability = current_platform.get_device_capability()
+    if spec.kernel == "megaflux_sm90" and (
+        capability is None or (capability.major, capability.minor) != (9, 0)
+    ):
+        unsupported.append("SM90 MegaFlux requires compute capability 9.0")
+    if spec.kernel != "megaflux_sm90" and (
+        capability is None
+        or (capability.major, capability.minor) not in ((10, 0), (10, 3))
+    ):
+        unsupported.append("FlashInfer CuTeDSL and DeepGEMM MoE-EP require SM100/SM103")
     weight_format = _WEIGHT_FORMATS.get(weight_key)
     if weight_format is None:
         unsupported.append(f"weight scheme {weight_key}")
@@ -147,7 +163,7 @@ def flashinfer_moe_ep_unsupported_reasons(
     if moe.swiglu_alpha is not None or moe.swiglu_beta is not None:
         unsupported.append("custom SwiGLU alpha or beta")
     if (
-        spec.kernel == "deep_gemm"
+        spec.kernel in ("deep_gemm", "megaflux_sm90")
         and moe.routing_method is not RoutingMethodType.DeepseekV4
     ):
         unsupported.append(f"routing method {moe.routing_method.name}")
@@ -157,7 +173,10 @@ def flashinfer_moe_ep_unsupported_reasons(
         unsupported.append("runtime weight transfer")
     if vllm_config.parallel_config.enable_dbo:
         unsupported.append("dual batch overlap")
-    if spec.kernel == "deep_gemm" and vllm_config.parallel_config.enable_eplb:
+    if (
+        spec.kernel in ("deep_gemm", "megaflux_sm90")
+        and vllm_config.parallel_config.enable_eplb
+    ):
         unsupported.append("EPLB")
     return tuple(unsupported)
 
@@ -231,7 +250,7 @@ def mxfp4_moe_ep_weights(
     w2_scale: torch.Tensor,
 ) -> FlashInferMoeEpWeights:
     spec = flashinfer_moe_ep_backend_spec(moe_backend)
-    if spec.kernel == "deep_gemm":
+    if spec.kernel in ("deep_gemm", "megaflux_sm90"):
         return FlashInferMoeEpWeights(w13, w2, w13_scale, w2_scale)
     return FlashInferMoeEpWeights(
         w13=_dequant_mxfp4_experts(w13, w13_scale),
@@ -314,7 +333,77 @@ class FlashInferMoeEp:
             w13_scale=weights.w13_scale,
             w2_scale=weights.w2_scale,
         )
-        if spec.kernel == "cutedsl":
+        replay_cls: type[Any] | None = None
+        if spec.kernel == "megaflux_sm90":
+            try:
+                from flashinfer.moe_ep.backends.mega.kernel.sm90 import (
+                    fp8_mxfp4_bf16_megaflux_graph as megaflux_graph,
+                )
+                from flashinfer.moe_ep.cute_dsl.megamoe.megaflux_sm90.benefit import (
+                    h200_replica_admission,
+                )
+                from flashinfer.moe_ep.cute_dsl.megamoe.megaflux_sm90.replay import (
+                    MegaFluxGraphReplay,
+                )
+                from flashinfer.moe_ep.megaflux_plan import PlanConfig
+            except ImportError as err:
+                raise RuntimeError(
+                    "SM90 MegaFlux requires a FlashInfer build with MegaFlux support"
+                ) from err
+            if os.environ.get("FLASHINFER_MOE_EP_MEGAFLUX_CUDA_GRAPH", "1") == "1":
+                replay_cls = MegaFluxGraphReplay
+            if moe.routing_method is not RoutingMethodType.DeepseekV4:
+                raise ValueError(
+                    "SM90 MegaFlux vLLM integration currently requires "
+                    "DeepseekV4 routing"
+                )
+            plan_config = PlanConfig(
+                num_logical_experts=moe.num_experts,
+                world_size=ep_group.world_size,
+                replica_budget=1,
+                max_tokens_per_source=moe.max_num_tokens,
+                top_k=moe.experts_per_token,
+            )
+            megakernel = megaflux_graph.Sm90_Mxfp4_MegaFluxGraphConfig(
+                replica_admission=h200_replica_admission(
+                    device_name=torch.cuda.get_device_name(weights.w13.device),
+                    experts=moe.num_experts,
+                    world_size=ep_group.world_size,
+                    hidden=moe.hidden_dim,
+                    intermediate=moe.intermediate_size,
+                    top_k=moe.experts_per_token,
+                    enabled=os.environ.get("FLASHINFER_MOE_EP_MEGAFLUX_ADMISSION", "1")
+                    == "1",
+                ),
+                intermediate_size=moe.intermediate_size,
+                top_k=moe.experts_per_token,
+                plan_config=plan_config,
+                selective_weight_copy=True,
+                metadata_transport=os.environ.get(
+                    "FLASHINFER_MOE_EP_MEGAFLUX_METADATA",
+                    "nccl",
+                ),
+                # EP8 H200 capacity sweeps found planning/copy overhead dominates
+                # both balanced and hotspot batches up to 256 tokens per rank.
+                # Keep replica planning available above this calibrated band.
+                min_replica_routes=int(
+                    os.environ.get(
+                        "FLASHINFER_MOE_EP_MEGAFLUX_MIN_REPLICA_ROUTES",
+                        ep_group.world_size
+                        * moe.experts_per_token
+                        * min(
+                            moe.max_num_tokens,
+                            256
+                            if "H200" in torch.cuda.get_device_name(weights.w13.device)
+                            else 1,
+                        )
+                        + 1,
+                    )
+                ),
+                gate_up_clamp=moe.swiglu_limit,
+                load_balance_mode="static",
+            )
+        elif spec.kernel == "cutedsl":
             # In-kernel fc2 reduce keeps its default (off); FlashInfer 0.7.1rc1
             # renamed in_kernel_fc2_reduce to enable_in_kernel_fc2_reduce.
             megakernel = api.Nvfp4CutedslMegaMoeConfig(
@@ -355,8 +444,13 @@ class FlashInferMoeEp:
         self._max_num_tokens = moe.max_num_tokens
         self._num_experts = moe.num_experts
         self._top_k = moe.experts_per_token
+        self._topk_indices_dtype = (
+            torch.int64 if spec.kernel == "megaflux_sm90" else torch.int32
+        )
         self._epilogue: FlashInferMoeEpEpilogue | None = epilogue
         self._return_workspace_view = moe.routing_method is RoutingMethodType.DeepseekV4
+        self._replay = None
+        self._replay_cls = replay_cls
 
     @property
     def can_overlap_shared_experts(self) -> bool:
@@ -368,7 +462,7 @@ class FlashInferMoeEp:
 
     @property
     def topk_indices_dtype(self) -> torch.dtype:
-        return torch.int32
+        return self._topk_indices_dtype
 
     @property
     def is_monolithic(self) -> bool:
@@ -381,6 +475,8 @@ class FlashInferMoeEp:
         topk_weights: torch.Tensor,
     ) -> Any:
         epilogue = cast(FlashInferMoeEpEpilogue, self._epilogue)
+        if topk_ids.dtype != self._topk_indices_dtype:
+            topk_ids = topk_ids.to(self._topk_indices_dtype)
         return self._moe_ep_tensors_cls(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
@@ -403,6 +499,8 @@ class FlashInferMoeEp:
                 f"FlashInfer MoE-EP got {hidden_states.shape[0]} tokens, but "
                 f"the workspace supports at most {self._max_num_tokens}"
             )
+        if self._replay is not None:
+            return self._replay(hidden_states, topk_ids, topk_weights)
         tensors = self._tensors(hidden_states, topk_ids, topk_weights)
         if self._return_workspace_view and getattr(
             self._mega_layer, "supports_output_view", False
@@ -421,7 +519,9 @@ class FlashInferMoeEp:
             device=self._device,
         )
         topk_ids = (
-            torch.arange(self._top_k, dtype=torch.int32, device=self._device)
+            torch.arange(
+                self._top_k, dtype=self.topk_indices_dtype, device=self._device
+            )
             .mul_(self._num_experts // self._top_k)
             .view(1, self._top_k)
         )
@@ -432,6 +532,14 @@ class FlashInferMoeEp:
             device=self._device,
         )
         self._mega_layer.warmup(self._tensors(hidden_states, topk_ids, topk_weights))
+        if self._replay_cls is not None and self._replay is None:
+            self._replay = self._replay_cls(
+                self._mega_layer,
+                max_tokens=self._max_num_tokens,
+                hidden_size=self._hidden_size,
+                top_k=self._top_k,
+                device=self._device,
+            )
 
     def kernel_weights(
         self,
@@ -443,7 +551,19 @@ class FlashInferMoeEp:
         """
         if self._mega_layer is None:
             raise RuntimeError("FlashInfer MoE-EP layer was destroyed")
-        (fc1_weight, fc1_sf), (fc2_weight, fc2_sf) = self._mega_layer._transformed
+        transformed = self._mega_layer._transformed
+        if self._topk_indices_dtype is torch.int64:
+            # MegaFlux stores each FC leg as (weight, folded_offset,
+            # activation_placeholder, residual_scale); EPLB is disabled
+            # for this backend, so expose the first two expert-major views.
+            fc1, fc2 = transformed
+            return (
+                _expert_major_bytes(fc1[0]),
+                _expert_major_bytes(fc1[1]),
+                _expert_major_bytes(fc2[0]),
+                _expert_major_bytes(fc2[1]),
+            )
+        (fc1_weight, fc1_sf), (fc2_weight, fc2_sf) = transformed
         return (
             _expert_major_bytes(fc1_weight),
             _expert_major_bytes(fc1_sf),
@@ -461,6 +581,9 @@ class FlashInferMoeEp:
         mega_layer = self._mega_layer
         if mega_layer is None:
             return
+        if self._replay is not None:
+            self._replay.close()
+            self._replay = None
         mega_layer.destroy()
         self._mega_layer = None
         self._epilogue = None

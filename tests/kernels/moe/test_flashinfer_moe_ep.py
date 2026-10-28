@@ -16,6 +16,7 @@ installed FlashInfer's config types, so config drift fails on any CI runner
 with FlashInfer installed.
 """
 
+import builtins
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -324,6 +325,15 @@ def test_adapter_kwargs_match_installed_flashinfer(
     index and the DeepGEMM import.
     """
     moe_ep = pytest.importorskip("flashinfer.moe_ep")
+    original_import = builtins.__import__
+
+    def without_megaflux(name, *args, **kwargs):
+        if "megaflux" in name:
+            raise ImportError("FlashInfer build without optional MegaFlux modules")
+        return original_import(name, *args, **kwargs)
+
+    # Ordinary backends must work with a FlashInfer build that lacks MegaFlux.
+    monkeypatch.setattr(builtins, "__import__", without_megaflux)
     layer_args: list[tuple] = []
 
     class FakeMegaLayer:

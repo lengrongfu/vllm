@@ -171,6 +171,7 @@ class Mxfp4MoeBackend(Enum):
     # FlashInfer MoE-EP megakernels: routing outside, dispatch/GEMMs/combine fused.
     FLASHINFER_MOE_EP_CUTEDSL = "FLASHINFER_MOE_EP_CUTEDSL"
     FLASHINFER_MOE_EP_DEEP_GEMM = "FLASHINFER_MOE_EP_DEEP_GEMM"
+    FLASHINFER_MOE_EP_MEGAFLUX_SM90 = "FLASHINFER_MOE_EP_MEGAFLUX_SM90"
 
 
 # Backends that share the same TRTLLM weight format
@@ -196,6 +197,7 @@ B12X_BACKENDS = (
 FLASHINFER_MOE_EP_MXFP4_BACKENDS = (
     Mxfp4MoeBackend.FLASHINFER_MOE_EP_CUTEDSL,
     Mxfp4MoeBackend.FLASHINFER_MOE_EP_DEEP_GEMM,
+    Mxfp4MoeBackend.FLASHINFER_MOE_EP_MEGAFLUX_SM90,
 )
 
 
@@ -371,6 +373,9 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
         "flashinfer_moe_ep_cutedsl": [Mxfp4MoeBackend.FLASHINFER_MOE_EP_CUTEDSL],
         "flashinfer_moe_ep_mega_deep_gemm": [
             Mxfp4MoeBackend.FLASHINFER_MOE_EP_DEEP_GEMM
+        ],
+        "flashinfer_moe_ep_megaflux_sm90": [
+            Mxfp4MoeBackend.FLASHINFER_MOE_EP_MEGAFLUX_SM90
         ],
         "triton": [Mxfp4MoeBackend.TRITON],
         "triton_unfused": [Mxfp4MoeBackend.TRITON_UNFUSED],

@@ -133,6 +133,7 @@ MoEBackend = Literal[
     "flashinfer_b12x",
     "b12x",
     "flashinfer_moe_ep_mega_deep_gemm",
+    "flashinfer_moe_ep_megaflux_sm90",
     "marlin",
     "humming",
     "triton_unfused",
@@ -148,12 +149,14 @@ MoEBackend = Literal[
 
 FLASHINFER_MOE_EP_CUTEDSL = "flashinfer_moe_ep_cutedsl"
 FLASHINFER_MOE_EP_DEEP_GEMM = "flashinfer_moe_ep_mega_deep_gemm"
+FLASHINFER_MOE_EP_MEGAFLUX_SM90 = "flashinfer_moe_ep_megaflux_sm90"
 
 # Backends implemented by the shared FlashInfer MoE-EP adapter.
 FLASHINFER_MOE_EP_BACKENDS = frozenset(
     {
         FLASHINFER_MOE_EP_CUTEDSL,
         FLASHINFER_MOE_EP_DEEP_GEMM,
+        FLASHINFER_MOE_EP_MEGAFLUX_SM90,
     }
 )
 # Those backends dispatch and combine themselves, so the framework must not
@@ -232,7 +235,10 @@ def validate_flashinfer_moe_ep_model(
     moe_backend: str, architectures: Iterable[str]
 ) -> None:
     """Reject model-specific FlashInfer MoE-EP backends."""
-    if moe_backend != FLASHINFER_MOE_EP_DEEP_GEMM:
+    if moe_backend not in (
+        FLASHINFER_MOE_EP_DEEP_GEMM,
+        FLASHINFER_MOE_EP_MEGAFLUX_SM90,
+    ):
         return
     if not any(arch in FLASHINFER_MOE_EP_ARCHITECTURES for arch in architectures):
         raise ValueError(
